@@ -185,10 +185,11 @@ class MultiViewModel(nn.Module):
     Uses separate task-specific heads for mass, calories, and macronutrients.
     """
 
-    def __init__(self, num_side_frames=16, use_overhead=False, use_depth=True):
+    def __init__(self, num_side_frames=16, use_overhead=False, use_depth=True, chunk_size=4):
         super().__init__()
         self.use_overhead = use_overhead
         self.use_depth = use_depth and use_overhead
+        self.chunk_size = chunk_size
 
         # Side angle encoder - EfficientNet-B3 (shared across frames)
         from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
@@ -268,11 +269,10 @@ class MultiViewModel(nn.Module):
         num_frames = side_frames.size(1)
         side_frames_flat = side_frames.view(batch_size * num_frames, 3, 256, 256)
 
-        # Process frames in chunks to avoid OOM
-        chunk_size = 16  # Process 16 frames at a time
+        # Process frames in smaller chunks to avoid OOM
         side_feats = []
-        for i in range(0, side_frames_flat.size(0), chunk_size):
-            chunk = side_frames_flat[i:i + chunk_size]
+        for i in range(0, side_frames_flat.size(0), self.chunk_size):
+            chunk = side_frames_flat[i:i + self.chunk_size]
             chunk_feat = self.side_encoder(chunk)
             side_feats.append(chunk_feat)
 
@@ -341,6 +341,8 @@ def main():
                         help='Learning rate (default: 1e-4)')
     parser.add_argument('--max-frames', type=int, default=16,
                         help='Maximum number of side angle frames per dish (default: 16)')
+    parser.add_argument('--chunk-size', type=int, default=4,
+                        help='Number of frames to process at once through encoder (default: 4, lower = less memory)')
     parser.add_argument('--train-csv', type=str, default=None,
                         help='Path to training CSV file (default: use built-in paths based on mode)')
     parser.add_argument('--test-csv', type=str, default=None,
@@ -418,7 +420,8 @@ def main():
     model = MultiViewModel(
         num_side_frames=args.max_frames,
         use_overhead=args.use_overhead,
-        use_depth=not args.no_depth
+        use_depth=not args.no_depth,
+        chunk_size=args.chunk_size
     ).to(device)
 
     # Multi-task MAE loss (following Nutrition5k paper)
