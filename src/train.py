@@ -332,6 +332,10 @@ def main():
                         help='Learning rate (default: 1e-4)')
     parser.add_argument('--max-frames', type=int, default=16,
                         help='Maximum number of side angle frames per dish (default: 16)')
+    parser.add_argument('--train-csv', type=str, default=None,
+                        help='Path to training CSV file (default: use built-in paths based on mode)')
+    parser.add_argument('--test-csv', type=str, default=None,
+                        help='Path to test CSV file (default: use built-in paths based on mode)')
     args = parser.parse_args()
 
     device = get_device()
@@ -341,11 +345,38 @@ def main():
     if args.use_overhead and args.no_depth:
         print("  (depth disabled)")
 
+    # Determine CSV paths
+    if args.train_csv:
+        train_side_csv = Path(args.train_csv)
+        # For multimodal training, look for corresponding overhead CSV
+        if args.use_overhead and 'multimodal_side' in args.train_csv:
+            train_overhead_csv = Path(args.train_csv.replace('multimodal_side', 'multimodal_overhead'))
+        elif args.use_overhead:
+            train_overhead_csv = OVERHEAD_TRAIN_CSV
+        else:
+            train_overhead_csv = None
+    else:
+        train_side_csv = SIDE_TRAIN_CSV
+        train_overhead_csv = OVERHEAD_TRAIN_CSV if args.use_overhead else None
+
+    if args.test_csv:
+        test_side_csv = Path(args.test_csv)
+        # For multimodal training, look for corresponding overhead CSV
+        if args.use_overhead and 'multimodal_side' in args.test_csv:
+            test_overhead_csv = Path(args.test_csv.replace('multimodal_side', 'multimodal_overhead'))
+        elif args.use_overhead:
+            test_overhead_csv = OVERHEAD_TEST_CSV
+        else:
+            test_overhead_csv = None
+    else:
+        test_side_csv = SIDE_TEST_CSV
+        test_overhead_csv = OVERHEAD_TEST_CSV if args.use_overhead else None
+
     # Create datasets
     print("\nLoading datasets...")
     train_ds = MultiViewDataset(
-        OVERHEAD_TRAIN_CSV if args.use_overhead else None,
-        SIDE_TRAIN_CSV,
+        train_overhead_csv,
+        train_side_csv,
         DATA_ROOT,
         train=True,
         max_side_frames=args.max_frames,
@@ -355,8 +386,8 @@ def main():
         gcs_prefix=args.gcs_prefix if args.use_gcs else None
     )
     val_ds = MultiViewDataset(
-        OVERHEAD_TEST_CSV if args.use_overhead else None,
-        SIDE_TEST_CSV,
+        test_overhead_csv,
+        test_side_csv,
         DATA_ROOT,
         train=False,
         max_side_frames=args.max_frames,
