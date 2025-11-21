@@ -264,10 +264,19 @@ class MultiViewModel(nn.Module):
     def forward(self, side_frames, overhead_rgb=None, overhead_depth=None):
         batch_size = side_frames.size(0)
 
-        # Encode side frames
+        # Encode side frames with chunking to reduce peak memory
         num_frames = side_frames.size(1)
         side_frames_flat = side_frames.view(batch_size * num_frames, 3, 256, 256)
-        side_feat = self.side_encoder(side_frames_flat)
+
+        # Process frames in chunks to avoid OOM
+        chunk_size = 16  # Process 16 frames at a time
+        side_feats = []
+        for i in range(0, side_frames_flat.size(0), chunk_size):
+            chunk = side_frames_flat[i:i + chunk_size]
+            chunk_feat = self.side_encoder(chunk)
+            side_feats.append(chunk_feat)
+
+        side_feat = torch.cat(side_feats, dim=0)
         side_feat = side_feat.view(batch_size, num_frames, -1)
 
         # Aggregate side features with BiLSTM
@@ -326,8 +335,8 @@ def main():
                         help='Path prefix in GCS bucket (default: nutrition5k_dataset/)')
     parser.add_argument('--epochs', type=int, default=20,
                         help='Number of epochs to train (default: 20)')
-    parser.add_argument('--batch-size', type=int, default=8,
-                        help='Batch size (default: 8)')
+    parser.add_argument('--batch-size', type=int, default=4,
+                        help='Batch size (default: 4)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate (default: 1e-4)')
     parser.add_argument('--max-frames', type=int, default=16,
