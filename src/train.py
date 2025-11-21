@@ -16,6 +16,7 @@ from torchvision import models, transforms
 from PIL import Image
 import math
 import argparse
+import io
 
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = REPO / "data" / "nutrition5k_dataset"
@@ -26,22 +27,38 @@ SIDE_TEST_CSV = REPO / "indexes" / "side_frames_test.csv"
 TARGETS = ["cal", "mass", "fat", "carb", "protein"]
 
 class MultiViewDataset(Dataset):
-    """Dataset that uses side angle views, optionally with overhead RGB/depth."""
+    """Dataset that uses side angle views, optionally with overhead RGB/depth.
 
-    def __init__(self, overhead_csv, side_csv, data_root, train=True, max_side_frames=16, use_overhead=False):
+    Supports both local filesystem and GCS streaming.
+    """
+
+    def __init__(self, overhead_csv, side_csv, data_root, train=True, max_side_frames=16,
+                 use_overhead=False, use_gcs=False, gcs_bucket=None, gcs_prefix=None):
         """
         Args:
             overhead_csv: Path to overhead images CSV (can be None if use_overhead=False)
             side_csv: Path to side angle frames CSV
-            data_root: Root directory for data
+            data_root: Root directory for data (ignored if use_gcs=True)
             train: Training mode (enables augmentation)
             max_side_frames: Maximum number of side frames to use per dish
             use_overhead: Whether to load overhead RGB/depth images
+            use_gcs: If True, stream images from GCS instead of local filesystem
+            gcs_bucket: GCS bucket name (required if use_gcs=True)
+            gcs_prefix: Path prefix in GCS bucket (required if use_gcs=True)
         """
-        self.data_root = Path(data_root)
+        self.data_root = Path(data_root) if not use_gcs else None
         self.train = train
         self.max_side_frames = max_side_frames
         self.use_overhead = use_overhead
+        self.use_gcs = use_gcs
+
+        # Setup GCS client if needed
+        if use_gcs:
+            from google.cloud import storage
+            self.storage_client = storage.Client()
+            self.bucket = self.storage_client.bucket(gcs_bucket)
+            self.gcs_prefix = gcs_prefix
+            print(f"Using GCS bucket: gs://{gcs_bucket}/{gcs_prefix}")
 
         # Load side angle data
         side_df = pd.read_csv(side_csv)
@@ -93,6 +110,18 @@ class MultiViewDataset(Dataset):
             transforms.ToTensor(),
         ])
 
+    def _load_image(self, image_path):
+        """Load image from either local filesystem or GCS."""
+        if self.use_gcs:
+            # Load from GCS
+            blob_path = self.gcs_prefix + image_path
+            blob = self.bucket.blob(blob_path)
+            image_bytes = blob.download_as_bytes()
+            return Image.open(io.BytesIO(image_bytes))
+        else:
+            # Load from local filesystem
+            return Image.open(self.data_root / image_path)
+
     def __len__(self):
         return len(self.df)
 
@@ -102,14 +131,12 @@ class MultiViewDataset(Dataset):
 
         # Load overhead RGB and depth if using overhead
         if self.use_overhead:
-            overhead_rgb_path = self.data_root / row['rgb']
-            overhead_rgb = Image.open(overhead_rgb_path).convert('RGB')
+            overhead_rgb = self._load_image(row['rgb']).convert('RGB')
             overhead_rgb = self.rgb_transform(overhead_rgb)
 
             # Load overhead depth (if available)
-            overhead_depth_path = self.data_root / row['depth_raw']
             try:
-                overhead_depth = Image.open(overhead_depth_path).convert('L')
+                overhead_depth = self._load_image(row['depth_raw']).convert('L')
                 overhead_depth = self.depth_transform(overhead_depth)
             except:
                 # If depth not available, use zeros
@@ -123,10 +150,11 @@ class MultiViewDataset(Dataset):
         side_frames = []
         for frame_path in side_frame_paths:
             try:
-                frame = Image.open(self.data_root / frame_path).convert('RGB')
+                frame = self._load_image(frame_path).convert('RGB')
                 frame = self.rgb_transform(frame)
                 side_frames.append(frame)
-            except:
+            except Exception as e:
+                # Skip failed frames
                 pass
 
         # Pad or truncate to max_side_frames
@@ -151,49 +179,86 @@ class MultiViewDataset(Dataset):
 
 
 class MultiViewModel(nn.Module):
-    """Multi-view model using side angles, optionally with overhead RGB/depth."""
+    """Multi-view model with EfficientNet-B3 backbone and multi-task heads.
+
+    Architecture inspired by Nutrition5k paper but with multi-view side angles.
+    Uses separate task-specific heads for mass, calories, and macronutrients.
+    """
 
     def __init__(self, num_side_frames=16, use_overhead=False, use_depth=True):
         super().__init__()
         self.use_overhead = use_overhead
-        self.use_depth = use_depth and use_overhead  # Depth only makes sense with overhead
+        self.use_depth = use_depth and use_overhead
 
-        # Side angle encoder (shared across frames)
-        self.side_encoder = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        side_feat_dim = self.side_encoder.fc.in_features
-        self.side_encoder.fc = nn.Identity()
+        # Side angle encoder - EfficientNet-B3 (shared across frames)
+        from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
+        self.side_encoder = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+        side_feat_dim = self.side_encoder.classifier[1].in_features
+        self.side_encoder.classifier = nn.Identity()  # Remove classification head
 
-        # Aggregation for side frames
-        self.side_aggregator = nn.LSTM(side_feat_dim, 256, batch_first=True, bidirectional=True)
+        # Aggregation for side frames - BiLSTM
+        self.side_aggregator = nn.LSTM(side_feat_dim, 768, batch_first=True, bidirectional=True)
+        aggregated_feat_dim = 1536  # 768 * 2 (bidirectional)
 
-        total_feat_dim = 512  # 512 from bidirectional LSTM
+        total_feat_dim = aggregated_feat_dim
 
         # Overhead encoders (if using overhead)
         if use_overhead:
-            # Overhead RGB encoder
-            self.overhead_rgb_encoder = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-            overhead_feat_dim = self.overhead_rgb_encoder.fc.in_features
-            self.overhead_rgb_encoder.fc = nn.Identity()
+            # Overhead RGB encoder - EfficientNet-B3
+            self.overhead_rgb_encoder = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+            overhead_feat_dim = self.overhead_rgb_encoder.classifier[1].in_features
+            self.overhead_rgb_encoder.classifier = nn.Identity()
             total_feat_dim += overhead_feat_dim
 
             # Overhead depth encoder (if using depth)
             if self.use_depth:
-                self.overhead_depth_encoder = models.resnet18(weights=None)
-                # Modify first conv for single channel
-                self.overhead_depth_encoder.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-                depth_feat_dim = self.overhead_depth_encoder.fc.in_features
-                self.overhead_depth_encoder.fc = nn.Identity()
+                self.overhead_depth_encoder = efficientnet_b3(weights=None)
+                # Modify first conv for single channel depth
+                original_conv = self.overhead_depth_encoder.features[0][0]
+                self.overhead_depth_encoder.features[0][0] = nn.Conv2d(
+                    1, original_conv.out_channels,
+                    kernel_size=original_conv.kernel_size,
+                    stride=original_conv.stride,
+                    padding=original_conv.padding,
+                    bias=False
+                )
+                depth_feat_dim = self.overhead_depth_encoder.classifier[1].in_features
+                self.overhead_depth_encoder.classifier = nn.Identity()
                 total_feat_dim += depth_feat_dim
 
-        # Fusion layer
-        self.fusion = nn.Sequential(
-            nn.Linear(total_feat_dim, 512),
+        # Shared fusion layers
+        self.shared_fc = nn.Sequential(
+            nn.Linear(total_feat_dim, 2048),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(512, 256),
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+        # Task-specific heads (following Nutrition5k paper structure)
+        # Mass prediction head
+        self.mass_head = nn.Sequential(
+            nn.Linear(1024, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, len(TARGETS))
+            nn.Linear(256, 1)
+        )
+
+        # Calorie prediction head
+        self.calorie_head = nn.Sequential(
+            nn.Linear(1024, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 1)
+        )
+
+        # Macronutrient prediction head (fat, carb, protein)
+        self.macro_head = nn.Sequential(
+            nn.Linear(1024, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 3)  # fat, carb, protein
         )
 
     def forward(self, side_frames, overhead_rgb=None, overhead_depth=None):
@@ -205,11 +270,11 @@ class MultiViewModel(nn.Module):
         side_feat = self.side_encoder(side_frames_flat)
         side_feat = side_feat.view(batch_size, num_frames, -1)
 
-        # Aggregate side features with LSTM
+        # Aggregate side features with BiLSTM
         side_feat, _ = self.side_aggregator(side_feat)
         side_feat = side_feat[:, -1, :]  # Take last hidden state
 
-        # Fuse features
+        # Collect features
         features = [side_feat]
 
         if self.use_overhead and overhead_rgb is not None:
@@ -220,11 +285,21 @@ class MultiViewModel(nn.Module):
                 overhead_depth_feat = self.overhead_depth_encoder(overhead_depth)
                 features.append(overhead_depth_feat)
 
+        # Fuse all features
         combined = torch.cat(features, dim=1)
 
-        # Predict
-        out = self.fusion(combined)
-        return out
+        # Shared layers
+        shared_repr = self.shared_fc(combined)
+
+        # Task-specific predictions
+        mass = self.mass_head(shared_repr)
+        calories = self.calorie_head(shared_repr)
+        macros = self.macro_head(shared_repr)  # [fat, carb, protein]
+
+        # Concatenate outputs in order: [cal, mass, fat, carb, protein]
+        output = torch.cat([calories, mass, macros], dim=1)
+
+        return output
 
 
 def get_device():
@@ -242,7 +317,12 @@ def main():
     parser.add_argument('--use-overhead', action='store_true',
                         help='Use overhead RGB and depth images (default: side angles only)')
     parser.add_argument('--no-depth', action='store_true',
-                        help='Disable depth images when using overhead (only works with --use-overhead)')
+                        help='Disable depth images when using overhead (only works with --use-overhead)')    parser.add_argument('--use-gcs', action='store_true',
+                        help='Stream images from GCS bucket instead of local filesystem')
+    parser.add_argument('--gcs-bucket', type=str, default='deepdiet-dataset',
+                        help='GCS bucket name (default: deepdiet-dataset)')
+    parser.add_argument('--gcs-prefix', type=str, default='nutrition5k_dataset/',
+                        help='Path prefix in GCS bucket (default: nutrition5k_dataset/)')
     parser.add_argument('--epochs', type=int, default=20,
                         help='Number of epochs to train (default: 20)')
     parser.add_argument('--batch-size', type=int, default=8,
@@ -255,6 +335,7 @@ def main():
 
     device = get_device()
     print(f"Device: {device}")
+    print(f"Data source: {'GCS bucket' if args.use_gcs else 'Local filesystem'}")
     print(f"Mode: {'Side angles + overhead RGB/depth' if args.use_overhead else 'Side angles only'}")
     if args.use_overhead and args.no_depth:
         print("  (depth disabled)")
@@ -267,7 +348,10 @@ def main():
         DATA_ROOT,
         train=True,
         max_side_frames=args.max_frames,
-        use_overhead=args.use_overhead
+        use_overhead=args.use_overhead,
+        use_gcs=args.use_gcs,
+        gcs_bucket=args.gcs_bucket if args.use_gcs else None,
+        gcs_prefix=args.gcs_prefix if args.use_gcs else None
     )
     val_ds = MultiViewDataset(
         OVERHEAD_TEST_CSV if args.use_overhead else None,
@@ -275,11 +359,18 @@ def main():
         DATA_ROOT,
         train=False,
         max_side_frames=args.max_frames,
-        use_overhead=args.use_overhead
+        use_overhead=args.use_overhead,
+        use_gcs=args.use_gcs,
+        gcs_bucket=args.gcs_bucket if args.use_gcs else None,
+        gcs_prefix=args.gcs_prefix if args.use_gcs else None
     )
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=False)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=False)
+    # Note: Use num_workers=0 when streaming from GCS to avoid authentication issues in workers
+    num_workers = 0 if args.use_gcs else 2
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                         num_workers=num_workers, pin_memory=(device.type == 'cuda'))
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                       num_workers=num_workers, pin_memory=(device.type == 'cuda'))
 
     # Create model
     print("\nInitializing model...")
@@ -289,19 +380,31 @@ def main():
         use_depth=not args.no_depth
     ).to(device)
 
-    criterion = nn.MSELoss()
+    # Multi-task MAE loss (following Nutrition5k paper)
+    criterion = nn.L1Loss(reduction='none')  # Per-element MAE
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    # Task weights (can be tuned)
+    task_weights = {
+        'cal': 1.0,
+        'mass': 1.0,
+        'fat': 1.0,
+        'carb': 1.0,
+        'protein': 1.0
+    }
 
     # Training loop
     best_val_loss = math.inf
 
     print(f"\nStarting training for {args.epochs} epochs...")
+    print(f"Loss: Multi-task MAE (cal, mass, fat, carb, protein)")
     print("=" * 70)
 
     for epoch in range(1, args.epochs + 1):
         # Train
         model.train()
-        train_loss, train_mae = 0.0, 0.0
+        train_losses = {task: 0.0 for task in TARGETS}
+        train_total_loss = 0.0
 
         for batch in train_dl:
             side_frames = batch['side_frames'].to(device)
@@ -317,20 +420,32 @@ def main():
 
             optimizer.zero_grad()
             pred = model(side_frames, overhead_rgb, overhead_depth)
-            loss = criterion(pred, targets)
-            loss.backward()
+
+            # Compute per-task MAE loss
+            task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
+
+            # Weighted sum of task losses
+            weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
+
+            weighted_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            train_loss += loss.item() * side_frames.size(0)
-            train_mae += mae_metric(pred.detach(), targets.detach()) * side_frames.size(0)
+            # Track losses
+            batch_size = side_frames.size(0)
+            train_total_loss += weighted_loss.item() * batch_size
+            for i, task in enumerate(TARGETS):
+                train_losses[task] += task_losses[i].item() * batch_size
 
-        train_loss /= len(train_ds)
-        train_mae /= len(train_ds)
+        # Average losses
+        train_total_loss /= len(train_ds)
+        for task in TARGETS:
+            train_losses[task] /= len(train_ds)
 
         # Validate
         model.eval()
-        val_loss, val_mae = 0.0, 0.0
+        val_losses = {task: 0.0 for task in TARGETS}
+        val_total_loss = 0.0
 
         with torch.no_grad():
             for batch in val_dl:
@@ -346,21 +461,35 @@ def main():
                     overhead_depth = overhead_depth.to(device)
 
                 pred = model(side_frames, overhead_rgb, overhead_depth)
-                loss = criterion(pred, targets)
 
-                val_loss += loss.item() * side_frames.size(0)
-                val_mae += mae_metric(pred, targets) * side_frames.size(0)
+                # Compute per-task MAE loss
+                task_losses = criterion(pred, targets).mean(dim=0)
 
-        val_loss /= len(val_ds)
-        val_mae /= len(val_ds)
+                # Weighted sum
+                weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
-        print(f"[Epoch {epoch:02d}/{args.epochs}] "
-              f"Train MSE: {train_loss:.3f} MAE: {train_mae:.3f} | "
-              f"Val MSE: {val_loss:.3f} MAE: {val_mae:.3f}")
+                # Track losses
+                batch_size = side_frames.size(0)
+                val_total_loss += weighted_loss.item() * batch_size
+                for i, task in enumerate(TARGETS):
+                    val_losses[task] += task_losses[i].item() * batch_size
+
+        # Average losses
+        val_total_loss /= len(val_ds)
+        for task in TARGETS:
+            val_losses[task] /= len(val_ds)
+
+        # Print epoch summary
+        print(f"[Epoch {epoch:02d}/{args.epochs}] Total Loss: {train_total_loss:.3f} / {val_total_loss:.3f}")
+        print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}")
+        print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}")
+        print(f"  Fat:     {train_losses['fat']:7.2f} / {val_losses['fat']:7.2f}")
+        print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}")
+        print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}")
 
         # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_total_loss < best_val_loss:
+            best_val_loss = val_total_loss
             model_name = "side_angles_best.pt" if not args.use_overhead else "multiview_best.pt"
             save_path = REPO / "indexes" / model_name
             torch.save(model.state_dict(), save_path)
@@ -373,7 +502,7 @@ def main():
                 print(f"  → Learning rate: {param_group['lr']:.6f}")
 
     print("=" * 70)
-    print(f"Training complete! Best validation MSE: {best_val_loss:.3f}")
+    print(f"Training complete! Best validation MAE: {best_val_loss:.3f}")
 
 
 if __name__ == "__main__":
