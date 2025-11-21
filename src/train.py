@@ -198,8 +198,9 @@ class MultiViewModel(nn.Module):
         self.side_encoder.classifier = nn.Identity()  # Remove classification head
 
         # Aggregation for side frames - BiLSTM
-        self.side_aggregator = nn.LSTM(side_feat_dim, 768, batch_first=True, bidirectional=True)
-        aggregated_feat_dim = 1536  # 768 * 2 (bidirectional)
+        lstm_hidden = 384  # Reduced from 768 to save memory
+        self.side_aggregator = nn.LSTM(side_feat_dim, lstm_hidden, batch_first=True, bidirectional=True)
+        aggregated_feat_dim = lstm_hidden * 2  # bidirectional
 
         total_feat_dim = aggregated_feat_dim
 
@@ -227,12 +228,12 @@ class MultiViewModel(nn.Module):
                 self.overhead_depth_encoder.classifier = nn.Identity()
                 total_feat_dim += depth_feat_dim
 
-        # Shared fusion layers
+        # Shared fusion layers (reduced size to save memory)
         self.shared_fc = nn.Sequential(
-            nn.Linear(total_feat_dim, 2048),
+            nn.Linear(total_feat_dim, 1024),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(2048, 1024),
+            nn.Linear(1024, 512),
             nn.ReLU(),
             nn.Dropout(0.2)
         )
@@ -240,26 +241,26 @@ class MultiViewModel(nn.Module):
         # Task-specific heads (following Nutrition5k paper structure)
         # Mass prediction head
         self.mass_head = nn.Sequential(
-            nn.Linear(1024, 256),
+            nn.Linear(512, 128),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 1)
+            nn.Linear(128, 1)
         )
 
         # Calorie prediction head
         self.calorie_head = nn.Sequential(
-            nn.Linear(1024, 256),
+            nn.Linear(512, 128),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 1)
+            nn.Linear(128, 1)
         )
 
         # Macronutrient prediction head (fat, carb, protein)
         self.macro_head = nn.Sequential(
-            nn.Linear(1024, 256),
+            nn.Linear(512, 128),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 3)  # fat, carb, protein
+            nn.Linear(128, 3)  # fat, carb, protein
         )
 
     def forward(self, side_frames, overhead_rgb=None, overhead_depth=None):
