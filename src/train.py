@@ -317,7 +317,8 @@ def main():
     parser.add_argument('--use-overhead', action='store_true',
                         help='Use overhead RGB and depth images (default: side angles only)')
     parser.add_argument('--no-depth', action='store_true',
-                        help='Disable depth images when using overhead (only works with --use-overhead)')    parser.add_argument('--use-gcs', action='store_true',
+                        help='Disable depth images when using overhead (only works with --use-overhead)')
+    parser.add_argument('--use-gcs', action='store_true',
                         help='Stream images from GCS bucket instead of local filesystem')
     parser.add_argument('--gcs-bucket', type=str, default='deepdiet-dataset',
                         help='GCS bucket name (default: deepdiet-dataset)')
