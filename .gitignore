@@ -1,4 +1,46 @@
-data/
-indexes/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Conda
+.conda/
+
+# Data and models
+data/
+*.pt
+*.pth
+*.h5
+*.ckpt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
+split.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Don't ignore requirements files!
+!requirements*.txt
+!environment.yml
+
+.idea/
