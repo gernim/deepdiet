@@ -19,6 +19,7 @@ import argparse
 import io
 import time
 from collections import defaultdict
+from tqdm import tqdm
 
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = REPO / "data" / "nutrition5k_dataset"
@@ -685,7 +686,9 @@ def main():
             grad_metrics_accum = defaultdict(float)
 
             batch_start = time.time()
-            for batch in train_dl:
+            # Add progress bar to monitor batches
+            train_pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+            for batch in train_pbar:
                 data_load_time += time.time() - batch_start
                 batch_count += 1
 
@@ -765,6 +768,14 @@ def main():
                 train_total_loss += weighted_loss.item() * batch_size
                 for i, task in enumerate(TARGETS):
                     train_losses[task] += task_losses[i].item() * batch_size
+
+                # Update progress bar with timing info
+                train_pbar.set_postfix({
+                    'loss': f'{weighted_loss.item():.2f}',
+                    'data': f'{data_load_time/batch_count:.2f}s',
+                    'fwd': f'{forward_time/batch_count:.2f}s',
+                    'bwd': f'{backward_time/batch_count:.2f}s'
+                })
 
                 batch_start = time.time()
 
