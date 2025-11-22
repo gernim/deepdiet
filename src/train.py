@@ -17,6 +17,8 @@ from PIL import Image
 import math
 import argparse
 import io
+import time
+from collections import defaultdict
 
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = REPO / "data" / "nutrition5k_dataset"
@@ -322,6 +324,202 @@ def mae_metric(pred, target):
     return (pred - target).abs().mean().item()
 
 
+def compute_gradient_metrics(model, prev_gradients=None, learning_rate=1e-4):
+    """Compute various gradient statistics for monitoring training."""
+    total_norm = 0.0
+    total_grad_sum = 0.0
+    total_grad_sq = 0.0
+    total_abs_grad = 0.0
+    num_params = 0
+
+    grad_list = []
+    current_gradients = []
+
+    for p in model.parameters():
+        if p.grad is not None:
+            grad = p.grad.data
+            grad_list.append(grad.flatten())
+            current_gradients.append(grad.flatten().clone())
+
+            total_norm += grad.norm(2).item() ** 2
+            total_grad_sum += grad.sum().item()
+            total_grad_sq += (grad ** 2).sum().item()
+            total_abs_grad += grad.abs().sum().item()
+            num_params += grad.numel()
+
+    if num_params == 0:
+        return {}, None
+
+    # Concatenate all gradients
+    all_grads = torch.cat(grad_list)
+    current_grads_tensor = torch.cat(current_gradients)
+
+    # Compute metrics
+    grad_norm = math.sqrt(total_norm)  # L2 norm
+    l2_metric = math.sqrt(total_grad_sq / num_params)  # L2
+    l1_l2_ratio = total_abs_grad / (l2_metric * math.sqrt(num_params)) if l2_metric > 0 else 0
+
+    # Effective dimension
+    effective_dim = (total_grad_sum ** 2) / total_grad_sq if total_grad_sq > 0 else 0
+
+    metrics = {
+        'grad_norm': grad_norm,
+        'grad_l2': l2_metric,
+        'grad_l1_l2_ratio': l1_l2_ratio,
+        'effective_dim': effective_dim,
+        'grad_mean': all_grads.mean().item(),
+        'grad_std': all_grads.std().item(),
+    }
+
+    # Gradient cosine similarity (if we have previous gradients)
+    if prev_gradients is not None:
+        prev_grads_tensor = torch.cat(prev_gradients)
+        cosine_sim = torch.nn.functional.cosine_similarity(
+            current_grads_tensor.unsqueeze(0),
+            prev_grads_tensor.unsqueeze(0)
+        ).item()
+        metrics['grad_cosine_sim'] = cosine_sim
+
+    return metrics, current_gradients
+
+
+def compute_per_layer_step_sizes(model, learning_rate):
+    """Compute effective step size per layer group."""
+    layer_stats = {}
+
+    # Group by major components
+    layer_groups = {
+        'side_encoder': [],
+        'side_aggregator': [],
+        'shared_fc': [],
+        'task_heads': []
+    }
+
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            # Compute effective step size: lr * ||g|| / ||w||
+            grad_norm = param.grad.norm(2).item()
+            weight_norm = param.data.norm(2).item()
+            effective_step = (learning_rate * grad_norm / weight_norm) if weight_norm > 0 else 0
+
+            # Classify into groups
+            if 'side_encoder' in name:
+                layer_groups['side_encoder'].append(effective_step)
+            elif 'side_aggregator' in name:
+                layer_groups['side_aggregator'].append(effective_step)
+            elif 'shared_fc' in name:
+                layer_groups['shared_fc'].append(effective_step)
+            elif any(head in name for head in ['mass_head', 'calorie_head', 'macro_head']):
+                layer_groups['task_heads'].append(effective_step)
+
+    # Average per group
+    for group, steps in layer_groups.items():
+        if steps:
+            layer_stats[group] = {
+                'mean_step': sum(steps) / len(steps),
+                'max_step': max(steps),
+                'min_step': min(steps)
+            }
+
+    return layer_stats
+
+
+def compute_activation_stats(model, side_frames, overhead_rgb=None, overhead_depth=None):
+    """Compute activation statistics (dead ReLUs, mean/std) - lightweight version."""
+    activation_stats = {}
+    hooks = []
+
+    relu_count = 0
+
+    def hook_fn(module_name):
+        def hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                # Only track key statistics to minimize overhead
+                with torch.no_grad():
+                    mean_val = output.mean().item()
+                    std_val = output.std().item()
+                    dead_frac = (output <= 0).float().mean().item()
+                    activation_stats[module_name] = {
+                        'mean': mean_val,
+                        'std': std_val,
+                        'dead_fraction': dead_frac
+                    }
+        return hook
+
+    # Register hooks only on key ReLU layers (not all to reduce overhead)
+    for name, module in model.named_modules():
+        if isinstance(module, nn.ReLU):
+            relu_count += 1
+            # Sample every 3rd ReLU to reduce overhead
+            if relu_count % 3 == 0:
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+
+    # Forward pass
+    try:
+        with torch.no_grad():
+            model(side_frames, overhead_rgb, overhead_depth)
+    finally:
+        # Always remove hooks
+        for hook in hooks:
+            hook.remove()
+
+    return activation_stats
+
+
+def compute_distance_from_init(model, initial_weights):
+    """Compute how far weights have moved from initialization."""
+    distances = {}
+
+    for name, param in model.named_parameters():
+        if name in initial_weights and param.requires_grad:
+            init_weight = initial_weights[name]
+            # Compute relative distance: ||w - w0|| / ||w0||
+            delta = param.data - init_weight
+            delta_norm = delta.norm(2).item()
+            init_norm = init_weight.norm(2).item()
+            rel_distance = delta_norm / init_norm if init_norm > 0 else 0
+
+            # Group by component
+            if 'side_encoder' in name:
+                group = 'side_encoder'
+            elif 'side_aggregator' in name:
+                group = 'side_aggregator'
+            elif 'shared_fc' in name:
+                group = 'shared_fc'
+            elif any(head in name for head in ['mass_head', 'calorie_head', 'macro_head']):
+                group = 'task_heads'
+            else:
+                group = 'other'
+
+            if group not in distances:
+                distances[group] = []
+            distances[group].append(rel_distance)
+
+    # Average per group
+    summary = {}
+    for group, dists in distances.items():
+        if dists:
+            summary[group] = {
+                'mean_dist': sum(dists) / len(dists),
+                'max_dist': max(dists)
+            }
+
+    return summary
+
+
+def compute_weight_stats(model):
+    """Compute weight statistics per layer."""
+    stats = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad and 'weight' in name:
+            stats[name] = {
+                'norm': param.data.norm(2).item(),
+                'mean': param.data.mean().item(),
+                'std': param.data.std().item(),
+            }
+    return stats
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train DeepDiet multi-view model')
     parser.add_argument('--use-overhead', action='store_true',
@@ -441,6 +639,10 @@ def main():
         'protein': 1.0
     }
 
+    # Store initial weights for distance tracking
+    print("Saving initial weights...")
+    initial_weights = {name: param.data.clone().cpu() for name, param in model.named_parameters() if param.requires_grad}
+
     # Training loop
     best_val_loss = math.inf
 
@@ -448,55 +650,110 @@ def main():
     print(f"Loss: Multi-task MAE (cal, mass, fat, carb, protein)")
     print("=" * 70)
 
-    for epoch in range(1, args.epochs + 1):
-        # Train
-        model.train()
-        train_losses = {task: 0.0 for task in TARGETS}
-        train_total_loss = 0.0
+    # Tracking for EWMA gradient metrics
+    grad_norm_history = []
+    prev_gradients = None
+    batch_grad_norms = []  # Track per-batch gradient norms for noise estimation
 
-        for batch in train_dl:
-            side_frames = batch['side_frames'].to(device)
-            targets = batch['targets'].to(device)
+    try:
+        for epoch in range(1, args.epochs + 1):
+            epoch_start = time.time()
 
-            overhead_rgb = batch.get('overhead_rgb')
-            overhead_depth = batch.get('overhead_depth')
+            # Train
+            model.train()
+            train_losses = {task: 0.0 for task in TARGETS}
+            train_total_loss = 0.0
 
-            if overhead_rgb is not None:
-                overhead_rgb = overhead_rgb.to(device)
-            if overhead_depth is not None:
-                overhead_depth = overhead_depth.to(device)
+            # Timing trackers
+            data_load_time = 0.0
+            forward_time = 0.0
+            backward_time = 0.0
+            batch_count = 0
+            grad_metrics_accum = defaultdict(float)
 
-            optimizer.zero_grad()
+            batch_start = time.time()
+            for batch in train_dl:
+                data_load_time += time.time() - batch_start
+                batch_count += 1
 
-            # Use mixed precision if available
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
+                forward_start = time.time()
+                side_frames = batch['side_frames'].to(device)
+                targets = batch['targets'].to(device)
+
+                overhead_rgb = batch.get('overhead_rgb')
+                overhead_depth = batch.get('overhead_depth')
+
+                if overhead_rgb is not None:
+                    overhead_rgb = overhead_rgb.to(device)
+                if overhead_depth is not None:
+                    overhead_depth = overhead_depth.to(device)
+
+                optimizer.zero_grad()
+
+                # Use mixed precision if available
+                if scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        pred = model(side_frames, overhead_rgb, overhead_depth)
+                        forward_time += time.time() - forward_start
+                        # Compute per-task MAE loss
+                        task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
+                        # Weighted sum of task losses
+                        weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
+
+                    backward_start = time.time()
+                    scaler.scale(weighted_loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                    # Compute gradient metrics periodically
+                    current_lr = optimizer.param_groups[0]['lr']
+                    if batch_count % 10 == 0:
+                        grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients, current_lr)
+                        for k, v in grad_metrics.items():
+                            grad_metrics_accum[k] += v
+                        prev_gradients = new_grads
+
+                    # Track batch gradient norm for noise estimation
+                    batch_grad_norm = sum(p.grad.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                    batch_grad_norms.append(batch_grad_norm)
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                    backward_time += time.time() - backward_start
+                else:
                     pred = model(side_frames, overhead_rgb, overhead_depth)
+                    forward_time += time.time() - forward_start
                     # Compute per-task MAE loss
                     task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
                     # Weighted sum of task losses
                     weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
-                scaler.scale(weighted_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                pred = model(side_frames, overhead_rgb, overhead_depth)
-                # Compute per-task MAE loss
-                task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
-                # Weighted sum of task losses
-                weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
-                weighted_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                    backward_start = time.time()
+                    weighted_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            # Track losses
-            batch_size = side_frames.size(0)
-            train_total_loss += weighted_loss.item() * batch_size
-            for i, task in enumerate(TARGETS):
-                train_losses[task] += task_losses[i].item() * batch_size
+                    # Compute gradient metrics periodically
+                    current_lr = optimizer.param_groups[0]['lr']
+                    if batch_count % 10 == 0:
+                        grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients, current_lr)
+                        for k, v in grad_metrics.items():
+                            grad_metrics_accum[k] += v
+                        prev_gradients = new_grads
+
+                    # Track batch gradient norm for noise estimation
+                    batch_grad_norm = sum(p.grad.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                    batch_grad_norms.append(batch_grad_norm)
+
+                    optimizer.step()
+                    backward_time += time.time() - backward_start
+
+                # Track losses
+                batch_size = side_frames.size(0)
+                train_total_loss += weighted_loss.item() * batch_size
+                for i, task in enumerate(TARGETS):
+                    train_losses[task] += task_losses[i].item() * batch_size
+
+                batch_start = time.time()
 
         # Average losses
         train_total_loss /= len(train_ds)
@@ -542,32 +799,136 @@ def main():
                 for i, task in enumerate(TARGETS):
                     val_losses[task] += task_losses[i].item() * batch_size
 
-        # Average losses
-        val_total_loss /= len(val_ds)
-        for task in TARGETS:
-            val_losses[task] /= len(val_ds)
+            # Average losses
+            val_total_loss /= len(val_ds)
+            for task in TARGETS:
+                val_losses[task] /= len(val_ds)
 
-        # Print epoch summary
-        print(f"[Epoch {epoch:02d}/{args.epochs}] Total Loss: {train_total_loss:.3f} / {val_total_loss:.3f}")
-        print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}")
-        print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}")
-        print(f"  Fat:     {train_losses['fat']:7.2f} / {val_losses['fat']:7.2f}")
-        print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}")
-        print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}")
+            epoch_time = time.time() - epoch_start
 
-        # Save best model
-        if val_total_loss < best_val_loss:
-            best_val_loss = val_total_loss
+            # Average gradient metrics
+            num_grad_samples = max(1, batch_count // 10)
+            for k in grad_metrics_accum:
+                grad_metrics_accum[k] /= num_grad_samples
+
+            # Track gradient norm history for EWMA
+            if 'grad_norm' in grad_metrics_accum:
+                grad_norm_history.append(grad_metrics_accum['grad_norm'])
+
+            # Print epoch summary
+            print(f"\n[Epoch {epoch:02d}/{args.epochs}] Time: {epoch_time:.1f}s (data: {data_load_time:.1f}s, fwd: {forward_time:.1f}s, bwd: {backward_time:.1f}s)")
+            print(f"  Total Loss: {train_total_loss:.3f} (train) / {val_total_loss:.3f} (val)")
+            print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}")
+            print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}")
+            print(f"  Fat:     {train_losses['fat']:7.2f} / {val_losses['fat']:7.2f}")
+            print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}")
+            print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}")
+
+            # Compute additional metrics (do this every few epochs to minimize overhead)
+            if epoch % 2 == 0:
+                # Gradient noise
+                if batch_grad_norms:
+                    import numpy as np
+                    grad_noise = np.std(batch_grad_norms[-50:]) if len(batch_grad_norms) >= 50 else np.std(batch_grad_norms)
+                    grad_noise_cv = grad_noise / (np.mean(batch_grad_norms[-50:]) + 1e-8) if len(batch_grad_norms) >= 50 else 0
+                else:
+                    grad_noise = 0
+                    grad_noise_cv = 0
+
+                # Per-layer step sizes
+                current_lr = optimizer.param_groups[0]['lr']
+                layer_steps = compute_per_layer_step_sizes(model, current_lr)
+
+                # Distance from initialization
+                dist_from_init = compute_distance_from_init(model, initial_weights)
+
+                # Activation stats (use first validation batch to avoid modifying training flow)
+                try:
+                    first_val_batch = next(iter(val_dl))
+                    val_side_frames = first_val_batch['side_frames'][:2].to(device)  # Just 2 samples
+                    val_overhead_rgb = first_val_batch.get('overhead_rgb')
+                    val_overhead_depth = first_val_batch.get('overhead_depth')
+                    if val_overhead_rgb is not None:
+                        val_overhead_rgb = val_overhead_rgb[:2].to(device)
+                    if val_overhead_depth is not None:
+                        val_overhead_depth = val_overhead_depth[:2].to(device)
+
+                    model.eval()
+                    activation_stats = compute_activation_stats(model, val_side_frames, val_overhead_rgb, val_overhead_depth)
+                    model.train()
+
+                    # Aggregate activation stats
+                    if activation_stats:
+                        avg_dead_fraction = np.mean([v['dead_fraction'] for v in activation_stats.values()])
+                    else:
+                        avg_dead_fraction = 0
+                except:
+                    avg_dead_fraction = 0
+                    layer_steps = {}
+                    dist_from_init = {}
+
+            # Print gradient metrics
+            if grad_metrics_accum:
+                print(f"  Grad norm: {grad_metrics_accum.get('grad_norm', 0):.4f}  |  " +
+                      f"L2: {grad_metrics_accum.get('grad_l2', 0):.6f}  |  " +
+                      f"Effective dim: {grad_metrics_accum.get('effective_dim', 0):.2f}")
+
+                if 'grad_cosine_sim' in grad_metrics_accum:
+                    print(f"  Cosine sim: {grad_metrics_accum['grad_cosine_sim']:.4f}  |  " +
+                          f"(1.0 = consistent direction, -1.0 = flipping)")
+
+                # Compute EWMA and EWSD if we have history
+                if len(grad_norm_history) >= 3:
+                    import numpy as np
+                    recent = grad_norm_history[-10:]
+                    ewma = np.mean(recent)
+                    ewsd = np.std(recent)
+                    print(f"  Grad EWMA: {ewma:.4f}  |  EWSD: {ewsd:.4f}")
+
+            # Print additional metrics every 2 epochs
+            if epoch % 2 == 0:
+                print(f"  Grad noise (CV): {grad_noise_cv:.4f}  |  Dead ReLUs: {avg_dead_fraction:.2%}")
+
+                # Per-layer step sizes
+                if layer_steps:
+                    print(f"  Layer steps: ", end="")
+                    for layer, stats in layer_steps.items():
+                        print(f"{layer}={stats['mean_step']:.6f} ", end="")
+                    print()
+
+                # Distance from init
+                if dist_from_init:
+                    print(f"  Distance from init: ", end="")
+                    for layer, stats in dist_from_init.items():
+                        print(f"{layer}={stats['mean_dist']:.3f} ", end="")
+                    print()
+
+            # Clear batch grad norms after each epoch
+            batch_grad_norms = []
+
+            # Save best model
+            if val_total_loss < best_val_loss:
+                best_val_loss = val_total_loss
+                model_name = "side_angles_best.pt" if not args.use_overhead else "multiview_best.pt"
+                save_path = REPO / "indexes" / model_name
+                torch.save(model.state_dict(), save_path)
+                print(f"  → Saved best model to {save_path}")
+
+            # Learning rate decay
+            if epoch % 5 == 0:
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= 0.5
+                    print(f"  → Learning rate: {param_group['lr']:.6f}")
+
+    except KeyboardInterrupt:
+        print("\n" + "=" * 70)
+        print("Training interrupted by user (Ctrl+C)")
+        if best_val_loss < math.inf:
+            print(f"Best validation MAE so far: {best_val_loss:.3f}")
             model_name = "side_angles_best.pt" if not args.use_overhead else "multiview_best.pt"
-            save_path = REPO / "indexes" / model_name
-            torch.save(model.state_dict(), save_path)
-            print(f"  → Saved best model to {save_path}")
-
-        # Learning rate decay
-        if epoch % 5 == 0:
-            for param_group in optimizer.param_groups:
-                param_group['lr'] *= 0.5
-                print(f"  → Learning rate: {param_group['lr']:.6f}")
+            print(f"Best model saved at: {REPO / 'indexes' / model_name}")
+        print("=" * 70)
+        return
 
     print("=" * 70)
     print(f"Training complete! Best validation MAE: {best_val_loss:.3f}")
