@@ -542,6 +542,8 @@ def main():
                         help='Maximum number of side angle frames per dish (default: 16)')
     parser.add_argument('--chunk-size', type=int, default=4,
                         help='Number of frames to process at once through encoder (default: 4, lower = less memory)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume training from (e.g., indexes/side_angles_best.pt)')
     parser.add_argument('--train-csv', type=str, default=None,
                         help='Path to training CSV file (default: use built-in paths based on mode)')
     parser.add_argument('--test-csv', type=str, default=None,
@@ -622,6 +624,17 @@ def main():
         use_depth=not args.no_depth,
         chunk_size=args.chunk_size
     ).to(device)
+
+    # Load checkpoint if resuming
+    start_epoch = 1
+    if args.resume:
+        print(f"Loading checkpoint from {args.resume}...")
+        checkpoint_path = Path(args.resume)
+        if checkpoint_path.exists():
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            print(f"✓ Resumed from checkpoint: {args.resume}")
+        else:
+            print(f"⚠ Checkpoint not found: {args.resume}, starting from scratch")
 
     # Multi-task MAE loss (following Nutrition5k paper)
     criterion = nn.L1Loss(reduction='none')  # Per-element MAE
