@@ -191,9 +191,9 @@ class MultiViewModel(nn.Module):
         self.use_depth = use_depth and use_overhead
         self.chunk_size = chunk_size
 
-        # Side angle encoder - EfficientNet-B3 (shared across frames)
-        from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
-        self.side_encoder = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+        # Side angle encoder - EfficientNet-B0 (smaller, memory efficient)
+        from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+        self.side_encoder = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
         side_feat_dim = self.side_encoder.classifier[1].in_features
         self.side_encoder.classifier = nn.Identity()  # Remove classification head
 
@@ -206,15 +206,15 @@ class MultiViewModel(nn.Module):
 
         # Overhead encoders (if using overhead)
         if use_overhead:
-            # Overhead RGB encoder - EfficientNet-B3
-            self.overhead_rgb_encoder = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+            # Overhead RGB encoder - EfficientNet-B0
+            self.overhead_rgb_encoder = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
             overhead_feat_dim = self.overhead_rgb_encoder.classifier[1].in_features
             self.overhead_rgb_encoder.classifier = nn.Identity()
             total_feat_dim += overhead_feat_dim
 
             # Overhead depth encoder (if using depth)
             if self.use_depth:
-                self.overhead_depth_encoder = efficientnet_b3(weights=None)
+                self.overhead_depth_encoder = efficientnet_b0(weights=None)
                 # Modify first conv for single channel depth
                 original_conv = self.overhead_depth_encoder.features[0][0]
                 self.overhead_depth_encoder.features[0][0] = nn.Conv2d(
@@ -429,6 +429,9 @@ def main():
     criterion = nn.L1Loss(reduction='none')  # Per-element MAE
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
+    # Use automatic mixed precision to reduce memory usage
+    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+
     # Task weights (can be tuned)
     task_weights = {
         'cal': 1.0,
@@ -464,17 +467,30 @@ def main():
                 overhead_depth = overhead_depth.to(device)
 
             optimizer.zero_grad()
-            pred = model(side_frames, overhead_rgb, overhead_depth)
 
-            # Compute per-task MAE loss
-            task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
+            # Use mixed precision if available
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    pred = model(side_frames, overhead_rgb, overhead_depth)
+                    # Compute per-task MAE loss
+                    task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
+                    # Weighted sum of task losses
+                    weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
-            # Weighted sum of task losses
-            weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
-
-            weighted_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+                scaler.scale(weighted_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                pred = model(side_frames, overhead_rgb, overhead_depth)
+                # Compute per-task MAE loss
+                task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
+                # Weighted sum of task losses
+                weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
+                weighted_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
             # Track losses
             batch_size = side_frames.size(0)
@@ -505,13 +521,20 @@ def main():
                 if overhead_depth is not None:
                     overhead_depth = overhead_depth.to(device)
 
-                pred = model(side_frames, overhead_rgb, overhead_depth)
-
-                # Compute per-task MAE loss
-                task_losses = criterion(pred, targets).mean(dim=0)
-
-                # Weighted sum
-                weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
+                # Use mixed precision for validation too
+                if scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        pred = model(side_frames, overhead_rgb, overhead_depth)
+                        # Compute per-task MAE loss
+                        task_losses = criterion(pred, targets).mean(dim=0)
+                        # Weighted sum
+                        weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
+                else:
+                    pred = model(side_frames, overhead_rgb, overhead_depth)
+                    # Compute per-task MAE loss
+                    task_losses = criterion(pred, targets).mean(dim=0)
+                    # Weighted sum
+                    weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
                 # Track losses
                 batch_size = side_frames.size(0)
