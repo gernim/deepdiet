@@ -36,7 +36,8 @@ class MultiViewDataset(Dataset):
     """
 
     def __init__(self, overhead_csv, side_csv, data_root, train=True, max_side_frames=16,
-                 use_overhead=False, use_gcs=False, gcs_bucket=None, gcs_prefix=None):
+                 use_overhead=False, use_gcs=False, gcs_bucket=None, gcs_prefix=None,
+                 image_size=256, cache_dir=None):
         """
         Args:
             overhead_csv: Path to overhead images CSV (can be None if use_overhead=False)
@@ -48,12 +49,16 @@ class MultiViewDataset(Dataset):
             use_gcs: If True, stream images from GCS instead of local filesystem
             gcs_bucket: GCS bucket name (required if use_gcs=True)
             gcs_prefix: Path prefix in GCS bucket (required if use_gcs=True)
+            image_size: Target image size (default 256, use 128 or 192 for faster training)
+            cache_dir: Optional directory to cache GCS images locally
         """
         self.data_root = Path(data_root) if not use_gcs else None
         self.train = train
         self.max_side_frames = max_side_frames
         self.use_overhead = use_overhead
         self.use_gcs = use_gcs
+        self.image_size = image_size
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
         # Setup GCS client if needed
         if use_gcs:
@@ -86,11 +91,14 @@ class MultiViewDataset(Dataset):
             self.df = dish_data[dish_data['dish_id'].isin(self.side_frames.keys())].reset_index(drop=True)
             print(f"Loaded {len(self.df)} dishes with side angle views only")
 
-        # Transforms for RGB images
+        # Calculate resize dimensions (slightly larger for cropping)
+        resize_size = int(image_size * 1.125)  # 12.5% larger for crop
+
+        # Transforms for side view RGB images (center crop to keep dish in frame)
         if train:
-            self.rgb_transform = transforms.Compose([
-                transforms.Resize(288),
-                transforms.RandomCrop(256),
+            self.side_transform = transforms.Compose([
+                transforms.Resize(resize_size),
+                transforms.CenterCrop(image_size),  # Center crop to focus on dish
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                 transforms.ToTensor(),
@@ -98,29 +106,56 @@ class MultiViewDataset(Dataset):
                                    std=[0.229, 0.224, 0.225]),
             ])
         else:
-            self.rgb_transform = transforms.Compose([
-                transforms.Resize(288),
-                transforms.CenterCrop(256),
+            self.side_transform = transforms.Compose([
+                transforms.Resize(resize_size),
+                transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                    std=[0.229, 0.224, 0.225]),
             ])
 
-        # Depth transform (normalize to 0-1)
+        # Overhead RGB transform (always center crop - dish is centered)
+        self.overhead_transform = transforms.Compose([
+            transforms.Resize(resize_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225]),
+        ])
+
+        # Depth transform (always center crop)
         self.depth_transform = transforms.Compose([
-            transforms.Resize(288),
-            transforms.CenterCrop(256) if not train else transforms.RandomCrop(256),
+            transforms.Resize(resize_size),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
         ])
 
     def _load_image(self, image_path):
-        """Load image from either local filesystem or GCS."""
+        """Load image from either local filesystem or GCS with optional caching."""
         if self.use_gcs:
-            # Load from GCS
-            blob_path = self.gcs_prefix + image_path
-            blob = self.bucket.blob(blob_path)
-            image_bytes = blob.download_as_bytes()
-            return Image.open(io.BytesIO(image_bytes))
+            # Check cache first if enabled
+            if hasattr(self, 'cache_dir') and self.cache_dir is not None:
+                cache_path = self.cache_dir / image_path
+                if cache_path.exists():
+                    return Image.open(cache_path)
+
+                # Load from GCS and cache
+                blob_path = self.gcs_prefix + image_path
+                blob = self.bucket.blob(blob_path)
+                image_bytes = blob.download_as_bytes()
+
+                # Save to cache
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, 'wb') as f:
+                    f.write(image_bytes)
+
+                return Image.open(io.BytesIO(image_bytes))
+            else:
+                # Load from GCS without caching
+                blob_path = self.gcs_prefix + image_path
+                blob = self.bucket.blob(blob_path)
+                image_bytes = blob.download_as_bytes()
+                return Image.open(io.BytesIO(image_bytes))
         else:
             # Load from local filesystem
             return Image.open(self.data_root / image_path)
@@ -135,7 +170,7 @@ class MultiViewDataset(Dataset):
         # Load overhead RGB and depth if using overhead
         if self.use_overhead:
             overhead_rgb = self._load_image(row['rgb']).convert('RGB')
-            overhead_rgb = self.rgb_transform(overhead_rgb)
+            overhead_rgb = self.overhead_transform(overhead_rgb)  # Use overhead-specific transform
 
             # Load overhead depth (if available)
             try:
@@ -143,7 +178,7 @@ class MultiViewDataset(Dataset):
                 overhead_depth = self.depth_transform(overhead_depth)
             except:
                 # If depth not available, use zeros
-                overhead_depth = torch.zeros(1, 256, 256)
+                overhead_depth = torch.zeros(1, self.image_size, self.image_size)
         else:
             overhead_rgb = None
             overhead_depth = None
@@ -154,7 +189,7 @@ class MultiViewDataset(Dataset):
         for frame_path in side_frame_paths:
             try:
                 frame = self._load_image(frame_path).convert('RGB')
-                frame = self.rgb_transform(frame)
+                frame = self.side_transform(frame)  # Use side-specific transform
                 side_frames.append(frame)
             except Exception as e:
                 # Skip failed frames
@@ -162,7 +197,7 @@ class MultiViewDataset(Dataset):
 
         # Pad or truncate to max_side_frames
         while len(side_frames) < self.max_side_frames:
-            side_frames.append(torch.zeros(3, 256, 256))
+            side_frames.append(torch.zeros(3, self.image_size, self.image_size))
         side_frames = torch.stack(side_frames[:self.max_side_frames])
 
         # Targets
@@ -543,6 +578,10 @@ def main():
                         help='Maximum number of side angle frames per dish (default: 16)')
     parser.add_argument('--chunk-size', type=int, default=4,
                         help='Number of frames to process at once through encoder (default: 4, lower = less memory)')
+    parser.add_argument('--image-size', type=int, default=256,
+                        help='Image size for training (default: 256, use 128 or 192 for faster training)')
+    parser.add_argument('--cache-dir', type=str, default=None,
+                        help='Directory to cache GCS images locally (speeds up subsequent epochs)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume training from (e.g., indexes/side_angles_best.pt)')
     parser.add_argument('--train-csv', type=str, default=None,
@@ -596,7 +635,9 @@ def main():
         use_overhead=args.use_overhead,
         use_gcs=args.use_gcs,
         gcs_bucket=args.gcs_bucket if args.use_gcs else None,
-        gcs_prefix=args.gcs_prefix if args.use_gcs else None
+        gcs_prefix=args.gcs_prefix if args.use_gcs else None,
+        image_size=args.image_size,
+        cache_dir=args.cache_dir
     )
     val_ds = MultiViewDataset(
         test_overhead_csv,
@@ -607,7 +648,9 @@ def main():
         use_overhead=args.use_overhead,
         use_gcs=args.use_gcs,
         gcs_bucket=args.gcs_bucket if args.use_gcs else None,
-        gcs_prefix=args.gcs_prefix if args.use_gcs else None
+        gcs_prefix=args.gcs_prefix if args.use_gcs else None,
+        image_size=args.image_size,
+        cache_dir=args.cache_dir
     )
 
     # Note: Use num_workers=0 when streaming from GCS to avoid authentication issues in workers
