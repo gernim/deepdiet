@@ -1,42 +1,103 @@
-from pyexpat import features
-
-import torchvision.models as M
-from numpy.random import weibull
+import torch
+from torchvision import models
 from torch import nn
 
 
 class DeepDietModel(nn.Module):
-    def __init__(self):
+    """
+    EfficientNet-BO inputs:
+        Side frames: [B x T, 3, 256, 256]
+        We are selecting T (max 16) images from each dish from generated 4 cameras * ~30 images.
+
+        Overhead RGB: [B, 3, 256, 256]
+
+        Overhead Depth: [B, 1, 256, 256]
+        Since pretrained weights are based on 3 channels, I convert this to 1 channel by averaging the RGB channels.
+
+    EfficientNet-BO outputs:
+        [B, T, 1280]
+        Classifier class logits are removed and feature vector is used as output.
+
+    BiLSTM inputs:
+        Side frames: [B x T, 1280]
+
+    """
+
+    def __init__(self, use_side_frames=True, use_overhead=True, use_depth=True):
         super().__init__()
-        backbone = M.inception_v3()
-        features = backbone.fc.in_features
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
 
-        self.shared = nn.Sequential(
-            nn.AdaptiveAvgPool2d((8,8)), nn.Flatten(),
-            nn.Linear(features, 4086), nn.ReLU(),
-            nn.Linear(4096, 4096), nn.ReLU()
+        total_features = 0
+
+        if use_side_frames:
+            self.side_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+            self.side_encoder.classifier = nn.Identity()
+            lstm_hidden = 640
+            self.side_aggregator = nn.LSTM(1280, lstm_hidden, batch_first=True, bidirectional=True)
+            total_features += lstm_hidden * 2
+
+        if use_overhead:
+            self.overhead_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+            self.overhead_encoder.classifier = nn.Identity()
+            total_features += self.overhead_encoder.classifier[1].in_features
+
+        if use_depth:
+            self.depth_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+            # Since pretrained weights are based on 3 channels, convert this to 1 channel by averaging the RGB channels.
+            original_conv = self.depth_encoder.features[0][0]
+            self.depth_encoder.features[0][0] = nn.Conv2d(1, original_conv.out_channels, kernel_size=original_conv.kernel_size, stride=original_conv.stride, padding=original_conv.padding, bias=False)
+            self.depth_encoder.classifier = nn.Identity()
+            total_features += self.depth_encoder.classifier[1].in_features
+
+        self.fusion_layers = nn.Sequential(
+            nn.Linear(total_features, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
 
-        def head(features):
-            return nn.Sequential(
-                nn.Linear(4096, 4096), nn.ReLU(),
-                nn.Linear(4096, 1)
-            )
-        self.cal = head();
-        self.mass = head();
-        self.fat = head();
-        self.carb = head();
-        self.protein = head();
-
-    def forward(self, x):
-        f = self.shared(self.backbone(x))
-
-        return dict(
-            cal = self.cal(f),
-            mass = self.mass(f),
-            fat = self.fat(f),
-            carb = self.carb(f),
-            protein = self.protein(f)
+        self.mass_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
         )
+
+        self.calorie_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
+        )
+
+        self.macro_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 3)
+        )
+
+    def forward(self, side_frames=None, overhead_rgb=None, overhead_depth=None):
+        features = []
+
+        if side_frames is not None:
+            side_feat, _ = self.side_aggregator(self.side_encoder(side_frames))
+            features.append(side_feat)
+
+        if overhead_rgb is not None:
+            features.append(self.overhead_encoder(overhead_rgb))
+
+        if overhead_depth is not None:
+            features.append(self.depth_encoder(overhead_depth))
+
+        concat_features = torch.cat(features, dim=1)
+        fused_features = self.fusion_layers(concat_features)
+        mass = self.mass_head(fused_features)
+        calories = self.calorie_head(fused_features)
+        macros = self.macro_head(fused_features)
+
+        return torch.cat([mass, calories, macros], dim=1)
+
+    def get_feature_dim(self):
+        return self.fusion_layers[-1].in_features
