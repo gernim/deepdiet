@@ -386,6 +386,9 @@ def main():
                 writer.add_scalar(f'MAE_train/{task}', train_losses[task], epoch)
                 writer.add_scalar(f'MAE_val/{task}', val_losses[task], epoch)
 
+            # Flush TensorBoard writer to disk
+            writer.flush()
+
             # Compute additional metrics (do this every few epochs to minimize overhead)
             if epoch % 2 == 0:
                 # Gradient noise
