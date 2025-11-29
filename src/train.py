@@ -388,6 +388,7 @@ def main():
 
             # Flush TensorBoard writer to disk
             writer.flush()
+            print(f"  [DEBUG] Logged {len(TARGETS)*2 + 6} metrics to TensorBoard for epoch {epoch}")
 
             # Compute additional metrics (do this every few epochs to minimize overhead)
             if epoch % 2 == 0:
