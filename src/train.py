@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import math
 import argparse
 import time
@@ -78,6 +79,21 @@ def main():
 
     device = get_device()
     print(f"Device: {device}")
+
+    # Create TensorBoard logger
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    modalities = []
+    if not args.no_side_frames:
+        modalities.append('side')
+    if args.use_overhead:
+        modalities.append('rgb')
+    if args.use_depth:
+        modalities.append('depth')
+    run_name = f"{'_'.join(modalities)}_{timestamp}"
+    log_dir = REPO / "runs" / run_name
+    writer = SummaryWriter(log_dir)
+    print(f"TensorBoard logs: {log_dir}")
+    print(f"Run: tensorboard --logdir runs/")
 
     # Build mode string based on enabled inputs
     enabled_inputs = []
@@ -358,6 +374,18 @@ def main():
             print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}")
             print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}")
 
+            # Log to TensorBoard
+            writer.add_scalar('Loss/train', train_total_loss, epoch)
+            writer.add_scalar('Loss/val', val_total_loss, epoch)
+            writer.add_scalar('Time/epoch', epoch_time, epoch)
+            writer.add_scalar('Time/data_load', data_load_time, epoch)
+            writer.add_scalar('Time/forward', forward_time, epoch)
+            writer.add_scalar('Time/backward', backward_time, epoch)
+
+            for task in TARGETS:
+                writer.add_scalar(f'MAE_train/{task}', train_losses[task], epoch)
+                writer.add_scalar(f'MAE_val/{task}', val_losses[task], epoch)
+
             # Compute additional metrics (do this every few epochs to minimize overhead)
             if epoch % 2 == 0:
                 # Gradient noise
@@ -399,25 +427,42 @@ def main():
                       f"L2: {grad_metrics_accum.get('grad_l2', 0):.6f}  |  " +
                       f"Effective dim: {grad_metrics_accum.get('effective_dim', 0):.2f}")
 
+                # Log gradient metrics to TensorBoard
+                writer.add_scalar('Gradients/norm', grad_metrics_accum.get('grad_norm', 0), epoch)
+                writer.add_scalar('Gradients/l2', grad_metrics_accum.get('grad_l2', 0), epoch)
+                writer.add_scalar('Gradients/l1_l2_ratio', grad_metrics_accum.get('grad_l1_l2_ratio', 0), epoch)
+                writer.add_scalar('Gradients/effective_dim', grad_metrics_accum.get('effective_dim', 0), epoch)
+                writer.add_scalar('Gradients/mean', grad_metrics_accum.get('grad_mean', 0), epoch)
+                writer.add_scalar('Gradients/std', grad_metrics_accum.get('grad_std', 0), epoch)
+
                 if 'grad_cosine_sim' in grad_metrics_accum:
                     print(f"  Cosine sim: {grad_metrics_accum['grad_cosine_sim']:.4f}  |  " +
                           f"(1.0 = consistent direction, -1.0 = flipping)")
+                    writer.add_scalar('Gradients/cosine_sim', grad_metrics_accum['grad_cosine_sim'], epoch)
 
                 # Compute EWMA and EWSD if we have history
                 if len(grad_norm_history) >= 3:
                     from src.metrics import update_ewma
                     ewma_metrics = update_ewma(grad_norm_history, window=10)
                     print(f"  Grad EWMA: {ewma_metrics['ewma']:.4f}  |  EWSD: {ewma_metrics['ewsd']:.4f}")
+                    writer.add_scalar('Gradients/ewma', ewma_metrics['ewma'], epoch)
+                    writer.add_scalar('Gradients/ewsd', ewma_metrics['ewsd'], epoch)
 
             # Print additional metrics every 2 epochs
             if epoch % 2 == 0:
                 print(f"  Grad noise (CV): {grad_noise_cv:.4f}  |  Dead ReLUs: {avg_dead_fraction:.2%}")
+
+                # Log additional metrics to TensorBoard
+                writer.add_scalar('Gradients/noise_cv', grad_noise_cv, epoch)
+                writer.add_scalar('Activations/dead_relu_fraction', avg_dead_fraction, epoch)
 
                 # Per-layer step sizes
                 if layer_steps:
                     print(f"  Layer steps: ", end="")
                     for layer, stats in layer_steps.items():
                         print(f"{layer}={stats['mean_step']:.6f} ", end="")
+                        writer.add_scalar(f'LayerSteps/{layer}_mean', stats['mean_step'], epoch)
+                        writer.add_scalar(f'LayerSteps/{layer}_max', stats['max_step'], epoch)
                     print()
 
                 # Distance from init
@@ -425,6 +470,8 @@ def main():
                     print(f"  Distance from init: ", end="")
                     for layer, stats in dist_from_init.items():
                         print(f"{layer}={stats['mean_dist']:.3f} ", end="")
+                        writer.add_scalar(f'Distance/{layer}_mean', stats['mean_dist'], epoch)
+                        writer.add_scalar(f'Distance/{layer}_max', stats['max_dist'], epoch)
                     print()
 
             # Clear batch grad norms after each epoch
@@ -452,10 +499,12 @@ def main():
             model_name = "side_angles_best.pt" if not args.use_overhead else "multiview_best.pt"
             print(f"Best model saved at: {REPO / 'indexes' / model_name}")
         print("=" * 70)
+        writer.close()
         return
 
     print("=" * 70)
     print(f"Training complete! Best validation MAE: {best_val_loss:.3f}")
+    writer.close()
 
 
 if __name__ == "__main__":
