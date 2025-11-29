@@ -305,49 +305,49 @@ def main():
 
                 batch_start = time.time()
 
-        # Average losses
-        train_total_loss /= len(train_ds)
-        for task in TARGETS:
-            train_losses[task] /= len(train_ds)
+            # Average losses
+            train_total_loss /= len(train_ds)
+            for task in TARGETS:
+                train_losses[task] /= len(train_ds)
 
-        # Validate
-        model.eval()
-        val_losses = {task: 0.0 for task in TARGETS}
-        val_total_loss = 0.0
+            # Validate
+            model.eval()
+            val_losses = {task: 0.0 for task in TARGETS}
+            val_total_loss = 0.0
 
-        with torch.no_grad():
-            for batch in val_dl:
-                side_frames = batch['side_frames'].to(device)
-                targets = batch['targets'].to(device)
+            with torch.no_grad():
+                for batch in val_dl:
+                    side_frames = batch['side_frames'].to(device)
+                    targets = batch['targets'].to(device)
 
-                overhead_rgb = batch.get('overhead_rgb')
-                overhead_depth = batch.get('overhead_depth')
+                    overhead_rgb = batch.get('overhead_rgb')
+                    overhead_depth = batch.get('overhead_depth')
 
-                if overhead_rgb is not None:
-                    overhead_rgb = overhead_rgb.to(device)
-                if overhead_depth is not None:
-                    overhead_depth = overhead_depth.to(device)
+                    if overhead_rgb is not None:
+                        overhead_rgb = overhead_rgb.to(device)
+                    if overhead_depth is not None:
+                        overhead_depth = overhead_depth.to(device)
 
-                # Use mixed precision for validation too
-                if scaler is not None:
-                    with torch.cuda.amp.autocast():
+                    # Use mixed precision for validation too
+                    if scaler is not None:
+                        with torch.cuda.amp.autocast():
+                            pred = model(side_frames, overhead_rgb, overhead_depth)
+                            # Compute per-task MAE loss
+                            task_losses = criterion(pred, targets).mean(dim=0)
+                            # Weighted sum
+                            weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
+                    else:
                         pred = model(side_frames, overhead_rgb, overhead_depth)
                         # Compute per-task MAE loss
                         task_losses = criterion(pred, targets).mean(dim=0)
                         # Weighted sum
                         weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
-                else:
-                    pred = model(side_frames, overhead_rgb, overhead_depth)
-                    # Compute per-task MAE loss
-                    task_losses = criterion(pred, targets).mean(dim=0)
-                    # Weighted sum
-                    weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
-                # Track losses
-                batch_size = side_frames.size(0)
-                val_total_loss += weighted_loss.item() * batch_size
-                for i, task in enumerate(TARGETS):
-                    val_losses[task] += task_losses[i].item() * batch_size
+                    # Track losses
+                    batch_size = side_frames.size(0)
+                    val_total_loss += weighted_loss.item() * batch_size
+                    for i, task in enumerate(TARGETS):
+                        val_losses[task] += task_losses[i].item() * batch_size
 
             # Average losses
             val_total_loss /= len(val_ds)
