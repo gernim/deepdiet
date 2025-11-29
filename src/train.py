@@ -247,18 +247,20 @@ def main():
                     backward_start = time.time()
                     scaler.scale(weighted_loss).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-                    # Compute gradient metrics periodically
+                    # Compute gradient metrics BEFORE clipping
                     if batch_count % 10 == 0:
                         grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients)
                         for k, v in grad_metrics.items():
                             grad_metrics_accum[k] += v
                         prev_gradients = new_grads
 
-                    # Track batch gradient norm for noise estimation
+                    # Track batch gradient norm for noise estimation (before clipping)
                     batch_grad_norm = sum(p.grad.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
                     batch_grad_norms.append(batch_grad_norm)
+
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
 
                     scaler.step(optimizer)
                     scaler.update()
@@ -273,18 +275,20 @@ def main():
 
                     backward_start = time.time()
                     weighted_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-                    # Compute gradient metrics periodically
+                    # Compute gradient metrics BEFORE clipping
                     if batch_count % 10 == 0:
                         grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients)
                         for k, v in grad_metrics.items():
                             grad_metrics_accum[k] += v
                         prev_gradients = new_grads
 
-                    # Track batch gradient norm for noise estimation
+                    # Track batch gradient norm for noise estimation (before clipping)
                     batch_grad_norm = sum(p.grad.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
                     batch_grad_norms.append(batch_grad_norm)
+
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
 
                     optimizer.step()
                     backward_time += time.time() - backward_start
