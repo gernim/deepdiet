@@ -92,12 +92,12 @@ class MultiViewDataset(Dataset):
 
             if self.use_overhead:
                 overhead_path = self.data_root / "imagery" / "realsense_overhead" / dish_id / "rgb.png"
-                if not overhead_path.is_file():
+                if not overhead_path.is_file() or overhead_path.stat().st_size == 0:
                     is_valid = False
 
             if self.use_depth:
                 depth_path = self.data_root / "imagery" / "realsense_overhead" / dish_id / "depth_raw.png"
-                if not depth_path.is_file():
+                if not depth_path.is_file() or depth_path.stat().st_size == 0:
                     is_valid = False
 
             if is_valid:
