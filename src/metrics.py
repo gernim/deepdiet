@@ -49,14 +49,14 @@ def compute_target_means(dataset, task_names):
     Used for computing MAE as percentage of mean (as in Nutrition5k paper).
 
     Args:
-        dataset: Dataset object (not DataLoader) - accesses .df directly to avoid loading images
+        dataset: Dataset object (not DataLoader) - accesses .metadata directly to avoid loading images
         task_names: List of task names (e.g., ['cal', 'mass', 'fat', 'carb', 'protein'])
 
     Returns:
         dict: {task_name: mean_value}
     """
-    # Access the dataframe directly to avoid loading images
-    df = dataset.df
+    # Access the metadata dataframe directly to avoid loading images
+    df = dataset.metadata
     target_means = {}
 
     for task in task_names:
