@@ -43,6 +43,33 @@ def compute_mae(predictions, targets, per_task=True):
         return {'mae': errors.mean().item()}
 
 
+def compute_target_means(dataloader, task_names):
+    """
+    Compute mean target values across entire dataset.
+    Used for computing MAE as percentage of mean (as in Nutrition5k paper).
+
+    Args:
+        dataloader: DataLoader for dataset
+        task_names: List of task names (e.g., ['cal', 'mass', 'fat', 'carb', 'protein'])
+
+    Returns:
+        dict: {task_name: mean_value}
+    """
+    target_sums = {task: 0.0 for task in task_names}
+    total_samples = 0
+
+    for batch in dataloader:
+        targets = batch['targets']
+        batch_size = targets.size(0)
+        total_samples += batch_size
+
+        for i, task in enumerate(task_names):
+            target_sums[task] += targets[:, i].sum().item()
+
+    target_means = {task: target_sums[task] / total_samples for task in task_names}
+    return target_means
+
+
 def compute_relative_mae(predictions, targets, epsilon=1e-6, per_task=True):
     """
     Relative Mean Absolute Error (scale-free)

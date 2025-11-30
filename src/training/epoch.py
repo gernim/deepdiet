@@ -5,7 +5,7 @@ from typing import Dict
 import torch
 from tqdm import tqdm
 from src.dataset import MultiViewDataset, TARGETS
-from src.metrics import compute_gradient_metrics, compute_relative_mae
+from src.metrics import compute_gradient_metrics
 
 
 def train_one_epoch(
@@ -23,7 +23,6 @@ def train_one_epoch(
 ):
     model.train()
     train_losses = {task: 0.0 for task in TARGETS}
-    train_mape = {task: 0.0 for task in TARGETS}
     train_total_loss = 0.0
 
     data_load_time, forward_time, backward_time = 0.0, 0.0, 0.0
@@ -79,10 +78,8 @@ def train_one_epoch(
 
         batch_size = targets.size(0)
         train_total_loss += weighted_losses.item() * batch_size
-        relative_mae = compute_relative_mae(pred, targets, per_task=True)
         for i, task in enumerate(TARGETS):
             train_losses[task] += task_losses[i].item() * batch_size
-            train_mape[task] += relative_mae[f'task_{i}'] * 100
 
         train_pbar.set_postfix({
             'loss': f'{weighted_losses.item():.2f}',
@@ -93,13 +90,11 @@ def train_one_epoch(
 
         batch_start = time.time()
 
-    # Average losses and MAPE
+    # Average losses
     dataset_size = len(dataloader.dataset)
-    num_batches = len(dataloader)
     train_total_loss /= dataset_size
     for task in TARGETS:
         train_losses[task] /= dataset_size
-        train_mape[task] /= num_batches
 
     # Average gradient metrics
     num_grad_samples = max(1, batch_count // config.grad_metrics_freq)
@@ -108,7 +103,6 @@ def train_one_epoch(
 
     return {
         'losses': train_losses,
-        'mape': train_mape,
         'total_loss': train_total_loss,
         'timing': {
             'data_load_time': data_load_time,

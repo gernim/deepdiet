@@ -29,8 +29,7 @@ from src.metrics import (
     compute_activation_stats,
     compute_distance_from_init,
     compute_gradient_noise,
-    compute_mae,
-    compute_relative_mae
+    compute_target_means
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -129,6 +128,13 @@ def main():
     val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False,
                        num_workers=config.num_workers, pin_memory=(device.type == 'cuda'))
 
+    # Compute mean target values for percentage calculations (matching paper methodology)
+    print("\nComputing dataset statistics...")
+    target_means = compute_target_means(train_dl, TARGETS)
+    print("Training set mean values:")
+    for task in TARGETS:
+        print(f"  {task}: {target_means[task]:.2f}")
+
     # Create model
     print("\nInitializing model...")
     model = DeepDietModel(
@@ -197,7 +203,6 @@ def main():
             )
 
             train_losses = train_result['losses']
-            train_mape = train_result['mape']
             train_total_loss = train_result['total_loss']
             data_load_time = train_result['timing']['data_load_time']
             forward_time = train_result['timing']['forward_time']
@@ -208,7 +213,6 @@ def main():
             # Validate
             model.eval()
             val_losses = {task: 0.0 for task in TARGETS}
-            val_mape = {task: 0.0 for task in TARGETS}
             val_total_loss = 0.0
 
             with torch.no_grad():
@@ -241,23 +245,17 @@ def main():
                         # Weighted sum
                         weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
-                    # Track losses and MAPE
+                    # Track losses
                     batch_size = targets.size(0)
                     val_total_loss += weighted_loss.item() * batch_size
 
-                    # Compute MAPE (using compute_relative_mae which returns percentage)
-                    relative_mae = compute_relative_mae(pred, targets, per_task=True)
-
                     for i, task in enumerate(TARGETS):
                         val_losses[task] += task_losses[i].item() * batch_size
-                        # convert relative MAE to percentage
-                        val_mape[task] += relative_mae[f'task_{i}'] * 100 * batch_size
 
-            # Average losses and MAPE
+            # Average losses
             val_total_loss /= len(val_ds)
             for task in TARGETS:
                 val_losses[task] /= len(val_ds)
-                val_mape[task] /= len(val_ds)
 
             epoch_time = time.time() - epoch_start
 
@@ -268,12 +266,12 @@ def main():
             # Print epoch summary
             print(f"\n[Epoch {epoch:02d}/{config.epochs}] Time: {epoch_time:.1f}s (data: {data_load_time:.1f}s, fwd: {forward_time:.1f}s, bwd: {backward_time:.1f}s)")
             print(f"  Total Loss: {train_total_loss:.3f} (train) / {val_total_loss:.3f} (val)")
-            print(f"  {'Task':<8} {'MAE (train/val)':<20} {'MAPE % (train/val)'}")
-            print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}   {train_mape['cal']:6.1f}% / {val_mape['cal']:6.1f}%")
-            print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}   {train_mape['mass']:6.1f}% / {val_mape['mass']:6.1f}%")
-            print(f"  Fat:     {train_losses['fat']:7.2f} / {val_losses['fat']:7.2f}   {train_mape['fat']:6.1f}% / {val_mape['fat']:6.1f}%")
-            print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}   {train_mape['carb']:6.1f}% / {val_mape['carb']:6.1f}%")
-            print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}   {train_mape['protein']:6.1f}% / {val_mape['protein']:6.1f}%")
+            print(f"  {'Task':<8} {'MAE (train/val)':<20} {'MAE % of mean (train/val)'}")
+            print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}   {train_losses['cal']/target_means['cal']*100:6.1f}% / {val_losses['cal']/target_means['cal']*100:6.1f}%")
+            print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}   {train_losses['mass']/target_means['mass']*100:6.1f}% / {val_losses['mass']/target_means['mass']*100:6.1f}%")
+            print(f"  Fat:     {train_losses['fat']:7.2f} / {val_losses['fat']:7.2f}   {train_losses['fat']/target_means['fat']*100:6.1f}% / {val_losses['fat']/target_means['fat']*100:6.1f}%")
+            print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}   {train_losses['carb']/target_means['carb']*100:6.1f}% / {val_losses['carb']/target_means['carb']*100:6.1f}%")
+            print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}   {train_losses['protein']/target_means['protein']*100:6.1f}% / {val_losses['protein']/target_means['protein']*100:6.1f}%")
 
             # Log to TensorBoard
             writer.add_scalar('Loss/train', train_total_loss, epoch)
