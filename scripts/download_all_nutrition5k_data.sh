@@ -127,7 +127,7 @@ mkdir -p imagery/side_angles
 echo "Downloading from deepdiet-dataset bucket (extracted frames)..."
 gsutil -m rsync -r \
     -x '.*\.h264$' \
-    "$SIDE_FRAMES_BUCKET/imagery/side_angles/" \
+    "$SIDE_FRAMES_BUCKET/nutrition5k_dataset/imagery/side_angles/" \
     imagery/side_angles/
 
 echo "✓ Side angle frames downloaded"
