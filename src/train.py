@@ -4,10 +4,12 @@ Multi-view training script for DeepDiet.
 Supports side angle images only, or side angles + overhead RGB/depth.
 """
 import warnings
+
 # Suppress torchvision libjpeg warnings before any imports
 warnings.filterwarnings('ignore', category=UserWarning, module='torchvision.io')
 warnings.filterwarnings('ignore', message='.*Failed to load image Python extension.*')
 
+from src.training.epoch import train_one_epoch
 from src.model import DeepDietModel
 from src.dataset import MultiViewDataset, TARGETS
 from src.config import TrainingConfig, create_config
@@ -21,11 +23,8 @@ from torch.utils.tensorboard import SummaryWriter
 import math
 import argparse
 import time
-from collections import defaultdict
-from tqdm import tqdm
 import numpy as np
 from src.metrics import (
-    compute_gradient_metrics,
     compute_per_layer_step_sizes,
     compute_activation_stats,
     compute_distance_from_init,
@@ -183,128 +182,28 @@ def main():
         for epoch in range(1, config.epochs + 1):
             epoch_start = time.time()
 
-            # Train
-            model.train()
-            train_losses = {task: 0.0 for task in TARGETS}
-            train_mape = {task: 0.0 for task in TARGETS}
-            train_total_loss = 0.0
+            train_result = train_one_epoch(
+                model=model,
+                dataloader=train_dl,
+                criterion=criterion,
+                optimizer=optimizer,
+                device=device,
+                config=config,
+                task_weights=task_weights,
+                epoch=epoch,
+                scaler=scaler,
+                prev_gradients=prev_gradients,
+                batch_grad_norms=batch_grad_norms
+            )
 
-            # Timing trackers
-            data_load_time = 0.0
-            forward_time = 0.0
-            backward_time = 0.0
-            batch_count = 0
-            grad_metrics_accum = defaultdict(float)
-
-            batch_start = time.time()
-            # Add progress bar to monitor batches
-            train_pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{config.epochs}", leave=False)
-            for batch in train_pbar:
-                data_load_time += time.time() - batch_start
-                batch_count += 1
-
-                forward_start = time.time()
-
-                targets = batch['targets'].to(device)
-                side_frames = batch.get('side_frames')
-                overhead_rgb = batch.get('overhead_rgb')
-                overhead_depth = batch.get('overhead_depth')
-
-                if side_frames is not None:
-                    side_frames = side_frames.to(device)
-                if overhead_rgb is not None:
-                    overhead_rgb = overhead_rgb.to(device)
-                if overhead_depth is not None:
-                    overhead_depth = overhead_depth.to(device)
-
-                optimizer.zero_grad()
-
-                # Use mixed precision if available
-                if scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        pred = model(side_frames, overhead_rgb, overhead_depth)
-                        forward_time += time.time() - forward_start
-                        # Compute per-task MAE loss
-                        task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
-                        # Weighted sum of task losses
-                        weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
-
-                    backward_start = time.time()
-                    scaler.scale(weighted_loss).backward()
-                    scaler.unscale_(optimizer)
-
-                    # Compute gradient metrics BEFORE clipping
-                    if batch_count % config.grad_metrics_freq == 0:
-                        grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients)
-                        for k, v in grad_metrics.items():
-                            grad_metrics_accum[k] += v
-                        prev_gradients = new_grads
-
-                    # Track batch gradient norm for noise estimation (before clipping)
-                    batch_grad_norm = sum(p.grad.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                    batch_grad_norms.append(batch_grad_norm)
-
-                    # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-
-                    scaler.step(optimizer)
-                    scaler.update()
-                    backward_time += time.time() - backward_start
-                else:
-                    pred = model(side_frames, overhead_rgb, overhead_depth)
-                    forward_time += time.time() - forward_start
-                    # Compute per-task MAE loss
-                    task_losses = criterion(pred, targets).mean(dim=0)  # [5] losses
-                    # Weighted sum of task losses
-                    weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
-
-                    backward_start = time.time()
-                    weighted_loss.backward()
-
-                    # Compute gradient metrics BEFORE clipping
-                    if batch_count % config.grad_metrics_freq == 0:
-                        grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients)
-                        for k, v in grad_metrics.items():
-                            grad_metrics_accum[k] += v
-                        prev_gradients = new_grads
-
-                    # Track batch gradient norm for noise estimation (before clipping)
-                    batch_grad_norm = sum(p.grad.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                    batch_grad_norms.append(batch_grad_norm)
-
-                    # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
-
-                    optimizer.step()
-                    backward_time += time.time() - backward_start
-
-                # Track losses and MAPE
-                batch_size = targets.size(0)
-                train_total_loss += weighted_loss.item() * batch_size
-
-                # Compute MAPE (using compute_relative_mae which returns percentage)
-                relative_mae = compute_relative_mae(pred, targets, per_task=True)
-
-                for i, task in enumerate(TARGETS):
-                    train_losses[task] += task_losses[i].item() * batch_size
-                    # convert relative MAE to percentage
-                    train_mape[task] += relative_mae[f'task_{i}'] * 100 * batch_size
-
-                # Update progress bar with timing info
-                train_pbar.set_postfix({
-                    'loss': f'{weighted_loss.item():.2f}',
-                    'data': f'{data_load_time/batch_count:.2f}s',
-                    'fwd': f'{forward_time/batch_count:.2f}s',
-                    'bwd': f'{backward_time/batch_count:.2f}s'
-                })
-
-                batch_start = time.time()
-
-            # Average losses and MAPE
-            train_total_loss /= len(train_ds)
-            for task in TARGETS:
-                train_losses[task] /= len(train_ds)
-                train_mape[task] /= len(train_ds)
+            train_losses = train_result['losses']
+            train_mape = train_result['mape']
+            train_total_loss = train_result['total_loss']
+            data_load_time = train_result['timing']['data_load_time']
+            forward_time = train_result['timing']['forward_time']
+            backward_time = train_result['timing']['backward_time']
+            grad_metrics_accum = train_result['grad_metrics']
+            prev_gradients = train_result['prev_gradients']
 
             # Validate
             model.eval()
