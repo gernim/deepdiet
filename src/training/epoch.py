@@ -82,7 +82,7 @@ def train_one_epoch(
         relative_mae = compute_relative_mae(pred, targets, per_task=True)
         for i, task in enumerate(TARGETS):
             train_losses[task] += task_losses[i].item() * batch_size
-            train_mape[task] += relative_mae[f'task_{i}'] * 100 * batch_size
+            train_mape[task] += relative_mae[f'task_{i}'] * 100
 
         train_pbar.set_postfix({
             'loss': f'{weighted_losses.item():.2f}',
@@ -95,10 +95,11 @@ def train_one_epoch(
 
     # Average losses and MAPE
     dataset_size = len(dataloader.dataset)
+    num_batches = len(dataloader)
     train_total_loss /= dataset_size
     for task in TARGETS:
         train_losses[task] /= dataset_size
-        train_mape[task] /= dataset_size
+        train_mape[task] /= num_batches
 
     # Average gradient metrics
     num_grad_samples = max(1, batch_count // config.grad_metrics_freq)
