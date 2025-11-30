@@ -261,11 +261,6 @@ def main():
 
             epoch_time = time.time() - epoch_start
 
-            # Average gradient metrics
-            num_grad_samples = max(1, batch_count // 10)
-            for k in grad_metrics_accum:
-                grad_metrics_accum[k] /= num_grad_samples
-
             # Track gradient norm history for EWMA
             if 'grad_norm' in grad_metrics_accum:
                 grad_norm_history.append(grad_metrics_accum['grad_norm'])
