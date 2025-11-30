@@ -130,7 +130,7 @@ def main():
 
     # Compute mean target values for percentage calculations (matching paper methodology)
     print("\nComputing dataset statistics...")
-    target_means = compute_target_means(train_dl, TARGETS)
+    target_means = compute_target_means(train_ds, TARGETS)
     print("Training set mean values:")
     for task in TARGETS:
         print(f"  {task}: {target_means[task]:.2f}")

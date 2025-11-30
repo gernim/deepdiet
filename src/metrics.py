@@ -43,30 +43,25 @@ def compute_mae(predictions, targets, per_task=True):
         return {'mae': errors.mean().item()}
 
 
-def compute_target_means(dataloader, task_names):
+def compute_target_means(dataset, task_names):
     """
     Compute mean target values across entire dataset.
     Used for computing MAE as percentage of mean (as in Nutrition5k paper).
 
     Args:
-        dataloader: DataLoader for dataset
+        dataset: Dataset object (not DataLoader) - accesses .df directly to avoid loading images
         task_names: List of task names (e.g., ['cal', 'mass', 'fat', 'carb', 'protein'])
 
     Returns:
         dict: {task_name: mean_value}
     """
-    target_sums = {task: 0.0 for task in task_names}
-    total_samples = 0
+    # Access the dataframe directly to avoid loading images
+    df = dataset.df
+    target_means = {}
 
-    for batch in dataloader:
-        targets = batch['targets']
-        batch_size = targets.size(0)
-        total_samples += batch_size
+    for task in task_names:
+        target_means[task] = df[task].mean()
 
-        for i, task in enumerate(task_names):
-            target_sums[task] += targets[:, i].sum().item()
-
-    target_means = {task: target_sums[task] / total_samples for task in task_names}
     return target_means
 
 
