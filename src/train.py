@@ -4,12 +4,13 @@ Multi-view training script for DeepDiet.
 Supports side angle images only, or side angles + overhead RGB/depth.
 """
 import warnings
+# Suppress torchvision libjpeg warnings before any imports
+warnings.filterwarnings('ignore', category=UserWarning, module='torchvision.io')
+warnings.filterwarnings('ignore', message='.*Failed to load image Python extension.*')
 
 from src.model import DeepDietModel
 from src.dataset import MultiViewDataset, TARGETS
 from src.config import TrainingConfig, create_config
-
-warnings.filterwarnings('ignore', category=UserWarning, module='torchvision.io')
 
 from pathlib import Path
 import torch
@@ -28,7 +29,9 @@ from src.metrics import (
     compute_per_layer_step_sizes,
     compute_activation_stats,
     compute_distance_from_init,
-    compute_gradient_noise
+    compute_gradient_noise,
+    compute_mae,
+    compute_relative_mae
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -42,10 +45,6 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def mae_metric(pred, target):
-    return (pred - target).abs().mean().item()
 
 
 def main():
@@ -187,6 +186,7 @@ def main():
             # Train
             model.train()
             train_losses = {task: 0.0 for task in TARGETS}
+            train_mape = {task: 0.0 for task in TARGETS}
             train_total_loss = 0.0
 
             # Timing trackers
@@ -278,11 +278,17 @@ def main():
                     optimizer.step()
                     backward_time += time.time() - backward_start
 
-                # Track losses
+                # Track losses and MAPE
                 batch_size = targets.size(0)
                 train_total_loss += weighted_loss.item() * batch_size
+
+                # Compute MAPE (using compute_relative_mae which returns percentage)
+                relative_mae = compute_relative_mae(pred, targets, per_task=True)
+
                 for i, task in enumerate(TARGETS):
                     train_losses[task] += task_losses[i].item() * batch_size
+                    # convert relative MAE to percentage
+                    train_mape[task] += relative_mae[f'task_{i}'] * 100 * batch_size
 
                 # Update progress bar with timing info
                 train_pbar.set_postfix({
@@ -294,14 +300,16 @@ def main():
 
                 batch_start = time.time()
 
-            # Average losses
+            # Average losses and MAPE
             train_total_loss /= len(train_ds)
             for task in TARGETS:
                 train_losses[task] /= len(train_ds)
+                train_mape[task] /= len(train_ds)
 
             # Validate
             model.eval()
             val_losses = {task: 0.0 for task in TARGETS}
+            val_mape = {task: 0.0 for task in TARGETS}
             val_total_loss = 0.0
 
             with torch.no_grad():
@@ -334,16 +342,23 @@ def main():
                         # Weighted sum
                         weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
-                    # Track losses
+                    # Track losses and MAPE
                     batch_size = targets.size(0)
                     val_total_loss += weighted_loss.item() * batch_size
+
+                    # Compute MAPE (using compute_relative_mae which returns percentage)
+                    relative_mae = compute_relative_mae(pred, targets, per_task=True)
+
                     for i, task in enumerate(TARGETS):
                         val_losses[task] += task_losses[i].item() * batch_size
+                        # convert relative MAE to percentage
+                        val_mape[task] += relative_mae[f'task_{i}'] * 100 * batch_size
 
-            # Average losses
+            # Average losses and MAPE
             val_total_loss /= len(val_ds)
             for task in TARGETS:
                 val_losses[task] /= len(val_ds)
+                val_mape[task] /= len(val_ds)
 
             epoch_time = time.time() - epoch_start
 
@@ -359,11 +374,12 @@ def main():
             # Print epoch summary
             print(f"\n[Epoch {epoch:02d}/{config.epochs}] Time: {epoch_time:.1f}s (data: {data_load_time:.1f}s, fwd: {forward_time:.1f}s, bwd: {backward_time:.1f}s)")
             print(f"  Total Loss: {train_total_loss:.3f} (train) / {val_total_loss:.3f} (val)")
-            print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}")
-            print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}")
-            print(f"  Fat:     {train_losses['fat']:7.2f} / {val_losses['fat']:7.2f}")
-            print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}")
-            print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}")
+            print(f"  {'Task':<8} {'MAE (train/val)':<20} {'MAPE % (train/val)'}")
+            print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}   {train_mape['cal']:6.1f}% / {val_mape['cal']:6.1f}%")
+            print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}   {train_mape['mass']:6.1f}% / {val_mape['mass']:6.1f}%")
+            print(f"  Fat:     {train_losses['fat']:7.2f} / {val_losses['fat']:7.2f}   {train_mape['fat']:6.1f}% / {val_mape['fat']:6.1f}%")
+            print(f"  Carb:    {train_losses['carb']:7.2f} / {val_losses['carb']:7.2f}   {train_mape['carb']:6.1f}% / {val_mape['carb']:6.1f}%")
+            print(f"  Protein: {train_losses['protein']:7.2f} / {val_losses['protein']:7.2f}   {train_mape['protein']:6.1f}% / {val_mape['protein']:6.1f}%")
 
             # Log to TensorBoard
             writer.add_scalar('Loss/train', train_total_loss, epoch)
@@ -376,6 +392,8 @@ def main():
             for task in TARGETS:
                 writer.add_scalar(f'MAE_train/{task}', train_losses[task], epoch)
                 writer.add_scalar(f'MAE_val/{task}', val_losses[task], epoch)
+                writer.add_scalar(f'MAPE_train/{task}', train_mape[task], epoch)
+                writer.add_scalar(f'MAPE_val/{task}', val_mape[task], epoch)
 
             # Flush TensorBoard writer to disk
             writer.flush()
@@ -418,9 +436,9 @@ def main():
 
             # Print gradient metrics
             if grad_metrics_accum:
-                print(f"  Grad norm: {grad_metrics_accum.get('grad_norm', 0):.4f}  |  " +
-                      f"L2: {grad_metrics_accum.get('grad_l2', 0):.6f}  |  " +
-                      f"Effective dim: {grad_metrics_accum.get('effective_dim', 0):.2f}")
+                print(f"  [Gradients] Norm: {grad_metrics_accum.get('grad_norm', 0):.4f}  |  " +
+                      f"L2 (RMS): {grad_metrics_accum.get('grad_l2', 0):.6f}  |  " +
+                      f"Effective Dim: {grad_metrics_accum.get('effective_dim', 0):.2f}")
 
                 # Log gradient metrics to TensorBoard
                 writer.add_scalar('Gradients/norm', grad_metrics_accum.get('grad_norm', 0), epoch)
@@ -431,7 +449,7 @@ def main():
                 writer.add_scalar('Gradients/std', grad_metrics_accum.get('grad_std', 0), epoch)
 
                 if 'grad_cosine_sim' in grad_metrics_accum:
-                    print(f"  Cosine sim: {grad_metrics_accum['grad_cosine_sim']:.4f}  |  " +
+                    print(f"  [Gradients] Cosine Similarity: {grad_metrics_accum['grad_cosine_sim']:.4f}  " +
                           f"(1.0 = consistent direction, -1.0 = flipping)")
                     writer.add_scalar('Gradients/cosine_sim', grad_metrics_accum['grad_cosine_sim'], epoch)
 
@@ -439,13 +457,13 @@ def main():
                 if len(grad_norm_history) >= 3:
                     from src.metrics import update_ewma
                     ewma_metrics = update_ewma(grad_norm_history, window=10)
-                    print(f"  Grad EWMA: {ewma_metrics['ewma']:.4f}  |  EWSD: {ewma_metrics['ewsd']:.4f}")
+                    print(f"  [Gradients] EWMA: {ewma_metrics['ewma']:.4f}  |  EWSD: {ewma_metrics['ewsd']:.4f}")
                     writer.add_scalar('Gradients/ewma', ewma_metrics['ewma'], epoch)
                     writer.add_scalar('Gradients/ewsd', ewma_metrics['ewsd'], epoch)
 
             # Print additional metrics every 2 epochs
             if epoch % 2 == 0:
-                print(f"  Grad noise (CV): {grad_noise_cv:.4f}  |  Dead ReLUs: {avg_dead_fraction:.2%}")
+                print(f"  [Gradients] Noise CV: {grad_noise_cv:.4f}  |  [Activations] Dead ReLUs: {avg_dead_fraction:.2%}")
 
                 # Log additional metrics to TensorBoard
                 writer.add_scalar('Gradients/noise_cv', grad_noise_cv, epoch)
@@ -453,7 +471,7 @@ def main():
 
                 # Per-layer step sizes
                 if layer_steps:
-                    print(f"  Layer steps: ", end="")
+                    print(f"  [Layer Step Sizes] ", end="")
                     for layer, stats in layer_steps.items():
                         print(f"{layer}={stats['mean_step']:.6f} ", end="")
                         writer.add_scalar(f'LayerSteps/{layer}_mean', stats['mean_step'], epoch)
@@ -462,7 +480,7 @@ def main():
 
                 # Distance from init
                 if dist_from_init:
-                    print(f"  Distance from init: ", end="")
+                    print(f"  [Distance from Init] ", end="")
                     for layer, stats in dist_from_init.items():
                         print(f"{layer}={stats['mean_dist']:.3f} ", end="")
                         writer.add_scalar(f'Distance/{layer}_mean', stats['mean_dist'], epoch)
