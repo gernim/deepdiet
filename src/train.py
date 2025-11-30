@@ -7,6 +7,7 @@ import warnings
 
 from src.model import DeepDietModel
 from src.dataset import MultiViewDataset, TARGETS
+from src.config import TrainingConfig, create_config
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torchvision.io')
 
@@ -49,8 +50,8 @@ def mae_metric(pred, target):
 
 def main():
     parser = argparse.ArgumentParser(description='Train DeepDiet multi-view model')
-    parser.add_argument('--no-side-frames', action='store_true',
-                        help='Disable side angle frames (default: enabled)')
+    parser.add_argument('--use-side-frames', action='store_true',
+                        help='Use side angle frames (default: enabled)')
     parser.add_argument('--use-overhead', action='store_true',
                         help='Use overhead RGB images (default: disabled)')
     parser.add_argument('--use-depth', action='store_true',
@@ -77,32 +78,19 @@ def main():
                         help='Path to test CSV file (default: use built-in paths based on mode)')
     args = parser.parse_args()
 
+    config = create_config(args, REPO)
+
     device = get_device()
     print(f"Device: {device}")
 
     # Create TensorBoard logger
     timestamp = time.strftime('%Y%m%d_%H%M%S')
-    modalities = []
-    if not args.no_side_frames:
-        modalities.append('side')
-    if args.use_overhead:
-        modalities.append('rgb')
-    if args.use_depth:
-        modalities.append('depth')
-    run_name = f"{'_'.join(modalities)}_{timestamp}"
+    enabled_inputs = config.get_input_channels()
+    run_name = f"{'_'.join(enabled_inputs)}_{timestamp}"
     log_dir = REPO / "runs" / run_name
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs: {log_dir}")
     print(f"Run: tensorboard --logdir runs/")
-
-    # Build mode string based on enabled inputs
-    enabled_inputs = []
-    if not args.no_side_frames:
-        enabled_inputs.append("side angles")
-    if args.use_overhead:
-        enabled_inputs.append("overhead RGB")
-    if args.use_depth:
-        enabled_inputs.append("overhead depth")
 
     if not enabled_inputs:
         print("ERROR: At least one input type must be enabled!")
@@ -111,75 +99,70 @@ def main():
     print(f"Mode: {' + '.join(enabled_inputs)}")
 
     # Determine CSV paths (use official splits by default)
-    train_csv = Path(args.train_csv) if args.train_csv else TRAIN_CSV
-    test_csv = Path(args.test_csv) if args.test_csv else TEST_CSV
+    train_csv = config.train_csv
+    test_csv = config.test_csv
 
     # Create datasets
     print("\nLoading datasets...")
     train_ds = MultiViewDataset(
         split_file=train_csv,
-        data_root=DATA_ROOT,
+        data_root=config.data_root,
         train=True,
-        max_side_frames=args.max_frames,
-        use_side_frames=not args.no_side_frames,
-        use_overhead=args.use_overhead,
-        use_depth=args.use_depth,
-        image_size=args.image_size
+        max_side_frames=config.max_frames,
+        use_side_frames=config.use_side_frames,
+        use_overhead=config.use_overhead,
+        use_depth=config.use_depth,
+        image_size=config.image_size
     )
     val_ds = MultiViewDataset(
         split_file=test_csv,
-        data_root=DATA_ROOT,
+        data_root=config.data_root,
         train=False,
-        max_side_frames=args.max_frames,
-        use_side_frames=not args.no_side_frames,
-        use_overhead=args.use_overhead,
-        use_depth=args.use_depth,
-        image_size=args.image_size
+        max_side_frames=config.max_frames,
+        use_side_frames=config.use_side_frames,
+        use_overhead=config.use_overhead,
+        use_depth=config.use_depth,
+        image_size=config.image_size
     )
 
     # Use 2 workers for data loading
-    num_workers = 2
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                         num_workers=num_workers, pin_memory=(device.type == 'cuda'))
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                       num_workers=num_workers, pin_memory=(device.type == 'cuda'))
+    train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,
+                         num_workers=config.num_workers, pin_memory=(device.type == 'cuda'))
+    val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False,
+                       num_workers=config.num_workers, pin_memory=(device.type == 'cuda'))
 
     # Create model
     print("\nInitializing model...")
     model = DeepDietModel(
-        use_side_frames=not args.no_side_frames,
-        use_overhead=args.use_overhead,
-        use_depth=args.use_depth,
-        chunk_size=args.chunk_size,
-        lstm_hidden=args.lstm_hidden,
+        use_side_frames=config.use_side_frames,
+        use_overhead=config.use_overhead,
+        use_depth=config.use_depth,
+        chunk_size=config.chunk_size,
+        lstm_hidden=config.lstm_hidden,
     ).to(device)
 
     # Load checkpoint if resuming
     start_epoch = 1
-    if args.resume:
-        print(f"Loading checkpoint from {args.resume}...")
-        checkpoint_path = Path(args.resume)
+    if config.resume_from:
+        print(f"Loading checkpoint from {config.resume_from}...")
+        checkpoint_path = config.resume_from
         if checkpoint_path.exists():
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-            print(f"✓ Resumed from checkpoint: {args.resume}")
+            print(f"Resumed from checkpoint: {config.resume_from}")
         else:
-            print(f"⚠ Checkpoint not found: {args.resume}, starting from scratch")
+            print(f"Checkpoint not found: {config.resume_from}, starting from scratch")
 
     # Multi-task MAE loss (following Nutrition5k paper)
     criterion = nn.L1Loss(reduction='none')  # Per-element MAE
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay
+    )
 
     # Use automatic mixed precision to reduce memory usage
     scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
-
-    # Task weights (can be tuned)
-    task_weights = {
-        'cal': 1.0,
-        'mass': 1.0,
-        'fat': 1.0,
-        'carb': 1.0,
-        'protein': 1.0
-    }
+    task_weights = config.task_weights
 
     # Store initial weights for distance tracking
     print("Saving initial weights...")
@@ -188,7 +171,7 @@ def main():
     # Training loop
     best_val_loss = math.inf
 
-    print(f"\nStarting training for {args.epochs} epochs...")
+    print(f"\nStarting training for {config.epochs} epochs...")
     print(f"Loss: Multi-task MAE (cal, mass, fat, carb, protein)")
     print("=" * 70)
 
@@ -198,7 +181,7 @@ def main():
     batch_grad_norms = []  # Track per-batch gradient norms for noise estimation
 
     try:
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(1, config.epochs + 1):
             epoch_start = time.time()
 
             # Train
@@ -215,18 +198,20 @@ def main():
 
             batch_start = time.time()
             # Add progress bar to monitor batches
-            train_pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+            train_pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{config.epochs}", leave=False)
             for batch in train_pbar:
                 data_load_time += time.time() - batch_start
                 batch_count += 1
 
                 forward_start = time.time()
-                side_frames = batch['side_frames'].to(device)
-                targets = batch['targets'].to(device)
 
+                targets = batch['targets'].to(device)
+                side_frames = batch.get('side_frames')
                 overhead_rgb = batch.get('overhead_rgb')
                 overhead_depth = batch.get('overhead_depth')
 
+                if side_frames is not None:
+                    side_frames = side_frames.to(device)
                 if overhead_rgb is not None:
                     overhead_rgb = overhead_rgb.to(device)
                 if overhead_depth is not None:
@@ -249,7 +234,7 @@ def main():
                     scaler.unscale_(optimizer)
 
                     # Compute gradient metrics BEFORE clipping
-                    if batch_count % 10 == 0:
+                    if batch_count % config.grad_metrics_freq == 0:
                         grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients)
                         for k, v in grad_metrics.items():
                             grad_metrics_accum[k] += v
@@ -260,7 +245,7 @@ def main():
                     batch_grad_norms.append(batch_grad_norm)
 
                     # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
 
                     scaler.step(optimizer)
                     scaler.update()
@@ -277,7 +262,7 @@ def main():
                     weighted_loss.backward()
 
                     # Compute gradient metrics BEFORE clipping
-                    if batch_count % 10 == 0:
+                    if batch_count % config.grad_metrics_freq == 0:
                         grad_metrics, new_grads = compute_gradient_metrics(model, prev_gradients)
                         for k, v in grad_metrics.items():
                             grad_metrics_accum[k] += v
@@ -288,13 +273,13 @@ def main():
                     batch_grad_norms.append(batch_grad_norm)
 
                     # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
 
                     optimizer.step()
                     backward_time += time.time() - backward_start
 
                 # Track losses
-                batch_size = side_frames.size(0)
+                batch_size = targets.size(0)
                 train_total_loss += weighted_loss.item() * batch_size
                 for i, task in enumerate(TARGETS):
                     train_losses[task] += task_losses[i].item() * batch_size
@@ -321,12 +306,14 @@ def main():
 
             with torch.no_grad():
                 for batch in val_dl:
-                    side_frames = batch['side_frames'].to(device)
-                    targets = batch['targets'].to(device)
 
+                    targets = batch['targets'].to(device)
+                    side_frames = batch.get('side_frames')
                     overhead_rgb = batch.get('overhead_rgb')
                     overhead_depth = batch.get('overhead_depth')
 
+                    if side_frames is not None:
+                        side_frames = side_frames.to(device)
                     if overhead_rgb is not None:
                         overhead_rgb = overhead_rgb.to(device)
                     if overhead_depth is not None:
@@ -348,7 +335,7 @@ def main():
                         weighted_loss = sum(task_losses[i] * task_weights[TARGETS[i]] for i in range(len(TARGETS)))
 
                     # Track losses
-                    batch_size = side_frames.size(0)
+                    batch_size = targets.size(0)
                     val_total_loss += weighted_loss.item() * batch_size
                     for i, task in enumerate(TARGETS):
                         val_losses[task] += task_losses[i].item() * batch_size
@@ -370,7 +357,7 @@ def main():
                 grad_norm_history.append(grad_metrics_accum['grad_norm'])
 
             # Print epoch summary
-            print(f"\n[Epoch {epoch:02d}/{args.epochs}] Time: {epoch_time:.1f}s (data: {data_load_time:.1f}s, fwd: {forward_time:.1f}s, bwd: {backward_time:.1f}s)")
+            print(f"\n[Epoch {epoch:02d}/{config.epochs}] Time: {epoch_time:.1f}s (data: {data_load_time:.1f}s, fwd: {forward_time:.1f}s, bwd: {backward_time:.1f}s)")
             print(f"  Total Loss: {train_total_loss:.3f} (train) / {val_total_loss:.3f} (val)")
             print(f"  Cal:     {train_losses['cal']:7.2f} / {val_losses['cal']:7.2f}")
             print(f"  Mass:    {train_losses['mass']:7.2f} / {val_losses['mass']:7.2f}")
@@ -395,9 +382,9 @@ def main():
             print(f"  [DEBUG] Logged {len(TARGETS)*2 + 6} metrics to TensorBoard for epoch {epoch}")
 
             # Compute additional metrics (do this every few epochs to minimize overhead)
-            if epoch % 2 == 0:
+            if epoch % config.advanced_metrics_freq == 0:
                 # Gradient noise
-                noise_metrics = compute_gradient_noise(batch_grad_norms, window=50)
+                noise_metrics = compute_gradient_noise(batch_grad_norms, window=config.grad_noise_window)
                 grad_noise_cv = noise_metrics['grad_noise_cv']
 
                 # Per-layer step sizes
@@ -419,7 +406,7 @@ def main():
                         val_overhead_depth = val_overhead_depth[:2].to(device)
 
                     model.eval()
-                    activation_result = compute_activation_stats(model, val_side_frames, val_overhead_rgb, val_overhead_depth, sample_rate=3)
+                    activation_result = compute_activation_stats(model, val_side_frames, val_overhead_rgb, val_overhead_depth, sample_rate=config.activation_sample_rate)
                     model.train()
 
                     # Get average dead fraction
@@ -488,15 +475,15 @@ def main():
             # Save best model
             if val_total_loss < best_val_loss:
                 best_val_loss = val_total_loss
-                model_name = "side_angles_best.pt" if not args.use_overhead else "multiview_best.pt"
+                model_name = "multiview_best.pt"
                 save_path = REPO / "indexes" / model_name
                 torch.save(model.state_dict(), save_path)
                 print(f"  → Saved best model to {save_path}")
 
             # Learning rate decay
-            if epoch % 5 == 0:
+            if epoch % config.lr_decay_epochs == 0:
                 for param_group in optimizer.param_groups:
-                    param_group['lr'] *= 0.5
+                    param_group['lr'] *= config.lr_decay_factor
                     print(f"  → Learning rate: {param_group['lr']:.6f}")
 
     except KeyboardInterrupt:
@@ -504,7 +491,7 @@ def main():
         print("Training interrupted by user (Ctrl+C)")
         if best_val_loss < math.inf:
             print(f"Best validation MAE so far: {best_val_loss:.3f}")
-            model_name = "side_angles_best.pt" if not args.use_overhead else "multiview_best.pt"
+            model_name = "multiview_best.pt"
             print(f"Best model saved at: {REPO / 'indexes' / model_name}")
         print("=" * 70)
         writer.close()
