@@ -284,12 +284,13 @@ def main():
             for task in TARGETS:
                 writer.add_scalar(f'MAE_train/{task}', train_losses[task], epoch)
                 writer.add_scalar(f'MAE_val/{task}', val_losses[task], epoch)
-                writer.add_scalar(f'MAPE_train/{task}', train_mape[task], epoch)
-                writer.add_scalar(f'MAPE_val/{task}', val_mape[task], epoch)
+                # Log MAE as percentage of mean (matching paper methodology)
+                writer.add_scalar(f'MAE_percent_train/{task}', train_losses[task]/target_means[task]*100, epoch)
+                writer.add_scalar(f'MAE_percent_val/{task}', val_losses[task]/target_means[task]*100, epoch)
 
             # Flush TensorBoard writer to disk
             writer.flush()
-            print(f"  [DEBUG] Logged {len(TARGETS)*2 + 6} metrics to TensorBoard for epoch {epoch}")
+            print(f"  [DEBUG] Logged {len(TARGETS)*4 + 6} metrics to TensorBoard for epoch {epoch}")
 
             # Compute additional metrics (do this every few epochs to minimize overhead)
             if epoch % config.advanced_metrics_freq == 0:
