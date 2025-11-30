@@ -9,6 +9,7 @@ set -e
 
 # Configuration
 SOURCE_BUCKET="gs://nutrition5k_dataset/nutrition5k_dataset"
+SIDE_FRAMES_BUCKET="gs://deepdiet-dataset"
 LOCAL_DIR="$HOME/deepdiet/data/nutrition5k_dataset"
 
 echo "=========================================="
@@ -112,7 +113,8 @@ echo "=========================================="
 echo "Step 5/5: Downloading Side Angle Frames"
 echo "=========================================="
 echo ""
-echo "Downloading side angle frames (~80 GB)..."
+echo "Downloading side angle frames from your bucket (~80 GB)..."
+echo "Source: $SIDE_FRAMES_BUCKET"
 echo "This is the largest component and will take 1-2 hours..."
 echo ""
 echo "Progress will be shown by gsutil..."
@@ -120,11 +122,12 @@ echo ""
 
 mkdir -p imagery/side_angles
 
-# Download all side angle frames
+# Download all side angle frames from your bucket
 # Exclude .h264 video files (we only need the sampled JPEG frames)
+echo "Downloading from deepdiet-dataset bucket (extracted frames)..."
 gsutil -m rsync -r \
     -x '.*\.h264$' \
-    "$SOURCE_BUCKET/imagery/side_angles/" \
+    "$SIDE_FRAMES_BUCKET/imagery/side_angles/" \
     imagery/side_angles/
 
 echo "✓ Side angle frames downloaded"
