@@ -7,6 +7,18 @@ from PIL import Image
 
 TARGETS = ["cal", "mass", "fat", "carb", "protein"]
 
+
+class PadToSquare:
+    """Pad image to square by adding black bars to shorter dimension."""
+    def __call__(self, img):
+        w, h = img.size
+        max_dim = max(w, h)
+        # Create black square canvas
+        padded = Image.new('RGB', (max_dim, max_dim), (0, 0, 0))
+        # Paste original image centered
+        padded.paste(img, ((max_dim - w) // 2, (max_dim - h) // 2))
+        return padded
+
 class MultiViewDataset(Dataset):
     def __init__(self, split_file, data_root, train=True, max_side_frames=16,
                  use_side_frames=True, use_overhead=False, use_depth=False, image_size=256):
@@ -109,10 +121,12 @@ class MultiViewDataset(Dataset):
         # Calculate resize dimensions (slightly larger for cropping)
         resize_size = int(image_size * 1.125)  # 12.5% larger for crop
 
+        # Side frames: pad to square first to preserve full 16:9 content
+        # 1920x1080 -> 1920x1920 (black bars top/bottom) -> 224x224
         if train:
             self.side_transform = transforms.Compose([
-                transforms.Resize(resize_size),
-                transforms.CenterCrop(image_size),
+                PadToSquare(),  # Pad to square, preserving all content
+                transforms.Resize((image_size, image_size)),  # Resize to target
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                 transforms.ToTensor(),
@@ -121,8 +135,8 @@ class MultiViewDataset(Dataset):
             ])
         else:
             self.side_transform = transforms.Compose([
-                transforms.Resize(resize_size),
-                transforms.CenterCrop(image_size),
+                PadToSquare(),  # Pad to square, preserving all content
+                transforms.Resize((image_size, image_size)),  # Resize to target
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225]),
