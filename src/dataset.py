@@ -144,8 +144,44 @@ class MultiViewDataset(Dataset):
 
     def _load_side_frames(self, dish_id):
         side_dir = self.data_root / "imagery" / "side_angles" / dish_id / "frames_sampled5"
-        frames = sorted(list(side_dir.glob("*.jpeg")))
-        return frames[:self.max_side_frames]
+        all_frames = sorted(list(side_dir.glob("*.jpeg")))
+
+        # Group frames by camera
+        from collections import defaultdict
+        camera_frames = defaultdict(list)
+        for frame_path in all_frames:
+            camera = frame_path.stem.split('_')[1]
+            camera_frames[camera].append(frame_path)
+
+        # Sort frames within each camera
+        for camera in camera_frames:
+            camera_frames[camera].sort()
+
+        cameras = sorted(camera_frames.keys())
+        frames_per_camera = self.max_side_frames // len(cameras)
+
+        # Sample evenly from each camera
+        sampled_per_camera = {}
+        for camera in cameras:
+            available = camera_frames[camera]
+            n = len(available)
+            if n == 0:
+                continue
+            if frames_per_camera >= n:
+                sampled_per_camera[camera] = available
+            else:
+                indices = [int(i * n / frames_per_camera) for i in range(frames_per_camera)]
+                sampled_per_camera[camera] = [available[i] for i in indices]
+
+        # Interleave cameras: [A0, B0, C0, D0, A1, B1, C1, D1, ...]
+        selected_frames = []
+        max_len = max(len(v) for v in sampled_per_camera.values())
+        for i in range(max_len):
+            for camera in cameras:
+                if i < len(sampled_per_camera.get(camera, [])):
+                    selected_frames.append(sampled_per_camera[camera][i])
+
+        return selected_frames[:self.max_side_frames]
 
     def __len__(self):
         return len(self.dish_ids)
