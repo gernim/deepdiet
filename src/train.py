@@ -73,6 +73,14 @@ def main():
                         help='Path to training CSV file (default: use built-in paths based on mode)')
     parser.add_argument('--test-csv', type=str, default=None,
                         help='Path to test CSV file (default: use built-in paths based on mode)')
+    parser.add_argument('--freeze-encoders', action='store_true',
+                        help='Freeze EfficientNet encoders initially (default: False)')
+    parser.add_argument('--unfreeze-epoch', type=int, default=10,
+                        help='Epoch to unfreeze encoders (default: 10)')
+    parser.add_argument('--encoder-lr-multiplier', type=float, default=0.1,
+                        help='LR multiplier for encoders when unfrozen (default: 0.1)')
+    parser.add_argument('--side-aggregation', type=str, default='lstm', choices=['lstm', 'mean'],
+                        help='Side frame aggregation method: lstm or mean (default: lstm)')
     args = parser.parse_args()
 
     config = create_config(args, REPO)
@@ -137,12 +145,14 @@ def main():
 
     # Create model
     print("\nInitializing model...")
+    print(f"Side aggregation: {config.side_aggregation}")
     model = DeepDietModel(
         use_side_frames=config.use_side_frames,
         use_overhead=config.use_overhead,
         use_depth=config.use_depth,
         chunk_size=config.chunk_size,
         lstm_hidden=config.lstm_hidden,
+        side_aggregation=config.side_aggregation,
     ).to(device)
 
     # Load checkpoint if resuming
@@ -156,10 +166,22 @@ def main():
         else:
             print(f"Checkpoint not found: {config.resume_from}, starting from scratch")
 
+    # Freeze encoders if configured
+    encoders_frozen = False
+    if config.freeze_encoders:
+        model.freeze_encoders()
+        encoders_frozen = True
+        frozen_params = sum(1 for p in model.parameters() if not p.requires_grad)
+        trainable_params = sum(1 for p in model.parameters() if p.requires_grad)
+        print(f"Encoders frozen: {frozen_params} params frozen, {trainable_params} params trainable")
+        print(f"Will unfreeze at epoch {config.unfreeze_epoch} with encoder LR multiplier {config.encoder_lr_multiplier}")
+
     # Multi-task MAE loss (following Nutrition5k paper)
     criterion = nn.L1Loss(reduction='none')  # Per-element MAE
+
+    # Create optimizer (only for trainable params initially)
     optimizer = optim.Adam(
-        model.parameters(),
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=config.learning_rate,
         weight_decay=config.weight_decay
     )
@@ -187,6 +209,32 @@ def main():
     try:
         for epoch in range(1, config.epochs + 1):
             epoch_start = time.time()
+
+            # Unfreeze encoders at the specified epoch
+            if encoders_frozen and epoch == config.unfreeze_epoch:
+                print(f"\n  *** Unfreezing encoders at epoch {epoch} ***")
+                model.unfreeze_encoders()
+                encoders_frozen = False
+
+                # Rebuild optimizer with discriminative learning rates
+                param_groups = model.get_param_groups(
+                    base_lr=config.learning_rate,
+                    encoder_lr_multiplier=config.encoder_lr_multiplier
+                )
+                optimizer = optim.Adam(
+                    param_groups,
+                    weight_decay=config.weight_decay
+                )
+
+                # Apply same LR decay that would have happened so far
+                num_decays = (epoch - 1) // config.lr_decay_epochs
+                for _ in range(num_decays):
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] *= config.lr_decay_factor
+
+                encoder_lr = optimizer.param_groups[1]['lr'] if len(optimizer.param_groups) > 1 else 0
+                other_lr = optimizer.param_groups[0]['lr']
+                print(f"  New optimizer: encoder LR = {encoder_lr:.6f}, other LR = {other_lr:.6f}")
 
             train_result = train_one_epoch(
                 model=model,

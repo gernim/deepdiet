@@ -20,6 +20,14 @@ class TrainingConfig:
     lstm_hidden: int = 640
     image_size: int = 256
 
+    # Encoder freezing
+    freeze_encoders: bool = True
+    unfreeze_epoch: int = 10  # Unfreeze encoders after this epoch
+    encoder_lr_multiplier: float = 0.1  # Encoder LR = base_lr * this when unfrozen
+
+    # Side frame aggregation
+    side_aggregation: str = 'lstm'  # 'lstm' or 'mean'
+
     # Inputs
     use_side_frames: bool = False
     use_overhead: bool = True
@@ -72,6 +80,14 @@ def create_config(args, repo_root: Path) -> TrainingConfig:
         chunk_size=args.chunk_size,
         lstm_hidden=args.lstm_hidden,
         image_size=args.image_size,
+
+        # Encoder freezing
+        freeze_encoders=getattr(args, 'freeze_encoders', False),
+        unfreeze_epoch=getattr(args, 'unfreeze_epoch', 10),
+        encoder_lr_multiplier=getattr(args, 'encoder_lr_multiplier', 0.1),
+
+        # Side frame aggregation
+        side_aggregation=getattr(args, 'side_aggregation', 'lstm'),
 
         # Inputs
         use_side_frames=args.use_side_frames,
