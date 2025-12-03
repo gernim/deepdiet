@@ -23,7 +23,7 @@ class DeepDietModel(nn.Module):
 
     """
 
-    def __init__(self, use_side_frames=True, use_overhead=True, use_depth=True, chunk_size=4, lstm_hidden=640, side_aggregation='lstm'):
+    def __init__(self, use_side_frames=True, use_overhead=True, use_depth=True, chunk_size=4, lstm_hidden=640, side_aggregation='lstm', allow_missing_modalities=False):
         super().__init__()
         self.use_side_frames = use_side_frames
         self.use_overhead = use_overhead
@@ -31,25 +31,38 @@ class DeepDietModel(nn.Module):
         self.chunk_size = chunk_size
         self.lstm_hidden = lstm_hidden
         self.side_aggregation = side_aggregation  # 'lstm' or 'mean'
+        self.allow_missing_modalities = allow_missing_modalities
 
         total_features = 0
 
+        # Side frames encoder
         if self.use_side_frames:
             self.side_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
             self.side_encoder.classifier = nn.Identity()
 
             if self.side_aggregation == 'lstm':
                 self.side_aggregator = nn.LSTM(1280, self.lstm_hidden, batch_first=True, bidirectional=True)
-                total_features += self.lstm_hidden * 2
+                side_feat_dim = self.lstm_hidden * 2
             else:
                 # Mean pooling: output is raw EfficientNet features (1280)
-                total_features += 1280
+                side_feat_dim = 1280
+            total_features += side_feat_dim
 
+            # Learned embedding for missing side frames
+            if self.allow_missing_modalities:
+                self.missing_side_embed = nn.Parameter(torch.randn(side_feat_dim) * 0.02)
+
+        # Overhead RGB encoder
         if self.use_overhead:
             self.overhead_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
             self.overhead_encoder.classifier = nn.Identity()
             total_features += 1280
 
+            # Learned embedding for missing overhead RGB
+            if self.allow_missing_modalities:
+                self.missing_overhead_embed = nn.Parameter(torch.randn(1280) * 0.02)
+
+        # Depth encoder
         if self.use_depth:
             self.depth_encoder = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
             # Since pretrained weights are based on 3 channels, convert this to 1 channel by averaging the RGB channels.
@@ -57,6 +70,10 @@ class DeepDietModel(nn.Module):
             self.depth_encoder.features[0][0] = nn.Conv2d(1, original_conv.out_channels, kernel_size=original_conv.kernel_size, stride=original_conv.stride, padding=original_conv.padding, bias=False)
             self.depth_encoder.classifier = nn.Identity()
             total_features += 1280
+
+            # Learned embedding for missing depth
+            if self.allow_missing_modalities:
+                self.missing_depth_embed = nn.Parameter(torch.randn(1280) * 0.02)
 
         self.fusion_layers = nn.Sequential(
             nn.Linear(total_features, 1024),
@@ -150,40 +167,70 @@ class DeepDietModel(nn.Module):
 
         return param_groups
 
+    def _get_batch_size(self, side_frames, overhead_rgb, overhead_depth):
+        """Get batch size from whichever input is available."""
+        if side_frames is not None:
+            return side_frames.size(0)
+        elif overhead_rgb is not None:
+            return overhead_rgb.size(0)
+        elif overhead_depth is not None:
+            return overhead_depth.size(0)
+        else:
+            raise ValueError("At least one modality must be provided")
+
     def forward(self, side_frames, overhead_rgb=None, overhead_depth=None):
         features = []
+        batch_size = self._get_batch_size(side_frames, overhead_rgb, overhead_depth)
+        device = next(self.parameters()).device
 
-        if self.use_side_frames and side_frames is not None:
-            batch_size = side_frames.size(0)
-            num_frames = side_frames.size(1)
+        # Side frames processing
+        if self.use_side_frames:
+            if side_frames is not None:
+                num_frames = side_frames.size(1)
 
-            # Flatten: [B, T, C, H, W] to [B * T, C, H, W]
-            side_frames_flat = side_frames.view(batch_size * num_frames, *side_frames.shape[2:])
-            side_features = []
+                # Flatten: [B, T, C, H, W] to [B * T, C, H, W]
+                side_frames_flat = side_frames.view(batch_size * num_frames, *side_frames.shape[2:])
+                side_features = []
 
-            for i in range(0, side_frames_flat.size(0), self.chunk_size):
-                chunk = side_frames_flat[i:i + self.chunk_size]
-                chunk_feat = self.side_encoder(chunk)
-                side_features.append(chunk_feat)
+                for i in range(0, side_frames_flat.size(0), self.chunk_size):
+                    chunk = side_frames_flat[i:i + self.chunk_size]
+                    chunk_feat = self.side_encoder(chunk)
+                    side_features.append(chunk_feat)
 
-            # Reshape: [B * T, 1280] -> [B, T, 1280]
-            side_features = torch.cat(side_features, dim=0).view(batch_size, num_frames, -1)
+                # Reshape: [B * T, 1280] -> [B, T, 1280]
+                side_features = torch.cat(side_features, dim=0).view(batch_size, num_frames, -1)
 
-            # Aggregate frame features
-            if self.side_aggregation == 'lstm':
-                side_feat, _ = self.side_aggregator(side_features)
-                side_feat = side_feat.mean(dim=1)
-            else:
-                # Simple mean pooling over frames
-                side_feat = side_features.mean(dim=1)
+                # Aggregate frame features
+                if self.side_aggregation == 'lstm':
+                    side_feat, _ = self.side_aggregator(side_features)
+                    side_feat = side_feat.mean(dim=1)
+                else:
+                    # Simple mean pooling over frames
+                    side_feat = side_features.mean(dim=1)
 
-            features.append(side_feat)
+                features.append(side_feat)
+            elif self.allow_missing_modalities:
+                # Use learned embedding for missing side frames
+                side_feat = self.missing_side_embed.unsqueeze(0).expand(batch_size, -1)
+                features.append(side_feat)
 
-        if self.use_overhead and overhead_rgb is not None:
-            features.append(self.overhead_encoder(overhead_rgb))
+        # Overhead RGB processing
+        if self.use_overhead:
+            if overhead_rgb is not None:
+                features.append(self.overhead_encoder(overhead_rgb))
+            elif self.allow_missing_modalities:
+                # Use learned embedding for missing overhead RGB
+                overhead_feat = self.missing_overhead_embed.unsqueeze(0).expand(batch_size, -1)
+                features.append(overhead_feat)
 
-        if self.use_depth and overhead_depth is not None:
-            features.append(self.depth_encoder(overhead_depth))
+        # Depth processing
+        if self.use_depth:
+            if overhead_depth is not None:
+                features.append(self.depth_encoder(overhead_depth))
+            elif self.allow_missing_modalities:
+                # Use learned embedding for missing depth
+                depth_feat = self.missing_depth_embed.unsqueeze(0).expand(batch_size, -1)
+                features.append(depth_feat)
 
         concat_features = torch.cat(features, dim=1)
         fused_features = self.fusion_layers(concat_features)
