@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore', message='.*Failed to load image Python extensi
 
 from src.training.epoch import train_one_epoch
 from src.model import DeepDietModel
-from src.dataset import MultiViewDataset, TARGETS
+from src.dataset import MultiViewDataset, TARGETS, multimodal_collate_fn
 from src.config import TrainingConfig, create_config
 
 from pathlib import Path
@@ -63,8 +63,8 @@ def main():
                         help='Maximum number of side angle frames per dish (default: 16)')
     parser.add_argument('--chunk-size', type=int, default=4,
                         help='Number of frames to process at once through encoder (default: 4, lower = less memory)')
-    parser.add_argument('--lstm-hidden', type=int, default=384,
-                        help='LSTM hidden size (default: 384)')
+    parser.add_argument('--lstm-hidden', type=int, default=640,
+                        help='LSTM hidden size (default: 640)')
     parser.add_argument('--image-size', type=int, default=256,
                         help='Image size for training (default: 256, use 128 or 192 for faster training)')
     parser.add_argument('--resume', type=str, default=None,
@@ -81,6 +81,8 @@ def main():
                         help='LR multiplier for encoders when unfrozen (default: 0.1)')
     parser.add_argument('--side-aggregation', type=str, default='lstm', choices=['lstm', 'mean'],
                         help='Side frame aggregation method: lstm or mean (default: lstm)')
+    parser.add_argument('--allow-missing-modalities', action='store_true',
+                        help='Allow training with partial modalities (uses learned embeddings for missing inputs)')
     args = parser.parse_args()
 
     config = create_config(args, REPO)
@@ -109,6 +111,8 @@ def main():
 
     # Create datasets
     print("\nLoading datasets...")
+    if config.allow_missing_modalities:
+        print("Allow missing modalities: ON (using learned embeddings for missing inputs)")
     train_ds = MultiViewDataset(
         split_file=train_csv,
         data_root=config.data_root,
@@ -117,7 +121,8 @@ def main():
         use_side_frames=config.use_side_frames,
         use_overhead=config.use_overhead,
         use_depth=config.use_depth,
-        image_size=config.image_size
+        image_size=config.image_size,
+        allow_missing_modalities=config.allow_missing_modalities
     )
     val_ds = MultiViewDataset(
         split_file=test_csv,
@@ -127,14 +132,19 @@ def main():
         use_side_frames=config.use_side_frames,
         use_overhead=config.use_overhead,
         use_depth=config.use_depth,
-        image_size=config.image_size
+        image_size=config.image_size,
+        allow_missing_modalities=config.allow_missing_modalities
     )
 
     # Use 2 workers for data loading
+    # Use custom collate function when allowing missing modalities
+    collate_fn = multimodal_collate_fn if config.allow_missing_modalities else None
     train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True,
-                         num_workers=config.num_workers, pin_memory=(device.type == 'cuda'))
+                         num_workers=config.num_workers, pin_memory=(device.type == 'cuda'),
+                         collate_fn=collate_fn)
     val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False,
-                       num_workers=config.num_workers, pin_memory=(device.type == 'cuda'))
+                       num_workers=config.num_workers, pin_memory=(device.type == 'cuda'),
+                       collate_fn=collate_fn)
 
     # Compute mean target values for percentage calculations (matching paper methodology)
     print("\nComputing dataset statistics...")
@@ -153,6 +163,7 @@ def main():
         chunk_size=config.chunk_size,
         lstm_hidden=config.lstm_hidden,
         side_aggregation=config.side_aggregation,
+        allow_missing_modalities=config.allow_missing_modalities,
     ).to(device)
 
     # Load checkpoint if resuming

@@ -28,6 +28,9 @@ class TrainingConfig:
     # Side frame aggregation
     side_aggregation: str = 'lstm'  # 'lstm' or 'mean'
 
+    # Missing modality handling
+    allow_missing_modalities: bool = False  # Allow training with partial modalities
+
     # Inputs
     use_side_frames: bool = False
     use_overhead: bool = True
@@ -88,6 +91,9 @@ def create_config(args, repo_root: Path) -> TrainingConfig:
 
         # Side frame aggregation
         side_aggregation=getattr(args, 'side_aggregation', 'lstm'),
+
+        # Missing modality handling
+        allow_missing_modalities=getattr(args, 'allow_missing_modalities', False),
 
         # Inputs
         use_side_frames=args.use_side_frames,

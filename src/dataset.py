@@ -8,6 +8,51 @@ from PIL import Image
 TARGETS = ["cal", "mass", "fat", "carb", "protein"]
 
 
+def multimodal_collate_fn(batch):
+    """
+    Custom collate function for batches with potentially missing modalities.
+
+    When allow_missing_modalities=True, different samples may have different keys.
+    This collate function handles that by only including keys that all samples have,
+    or by padding missing modalities with None values.
+    """
+    # Get all keys present in all samples
+    all_keys = set(batch[0].keys())
+
+    # Collect values for each key
+    result = {}
+
+    # Always stack targets (required for all samples)
+    result['targets'] = torch.stack([item['targets'] for item in batch])
+
+    # Collect dish_ids as list
+    result['dish_id'] = [item['dish_id'] for item in batch]
+
+    # For optional modalities, check if any sample has them
+    for key in ['side_frames', 'overhead_rgb', 'overhead_depth']:
+        values = [item.get(key) for item in batch]
+        if any(v is not None for v in values):
+            # If any sample has this modality, stack the ones that have it
+            # and use zeros for those that don't
+            if all(v is not None for v in values):
+                result[key] = torch.stack(values)
+            else:
+                # Mixed batch - need to handle missing values
+                # Get the shape from a non-None value
+                template = next(v for v in values if v is not None)
+                stacked = []
+                for v in values:
+                    if v is not None:
+                        stacked.append(v)
+                    else:
+                        stacked.append(torch.zeros_like(template))
+                result[key] = torch.stack(stacked)
+                # Track which samples have this modality
+                result[f'{key}_mask'] = torch.tensor([v is not None for v in values])
+
+    return result
+
+
 class PadToSquare:
     """Pad image to square by adding black bars to shorter dimension."""
     def __call__(self, img):
@@ -21,7 +66,8 @@ class PadToSquare:
 
 class MultiViewDataset(Dataset):
     def __init__(self, split_file, data_root, train=True, max_side_frames=16,
-                 use_side_frames=True, use_overhead=False, use_depth=False, image_size=256):
+                 use_side_frames=True, use_overhead=False, use_depth=False, image_size=256,
+                 allow_missing_modalities=False):
         self.data_root = Path(data_root)
         self.train = train
         self.max_side_frames = max_side_frames
@@ -29,6 +75,7 @@ class MultiViewDataset(Dataset):
         self.use_overhead = use_overhead
         self.use_depth = use_depth
         self.image_size = image_size
+        self.allow_missing_modalities = allow_missing_modalities
 
         split = pd.read_csv(split_file)
         all_dish_ids = split['dish_id'].tolist()
@@ -90,43 +137,81 @@ class MultiViewDataset(Dataset):
         self.metadata = metadata
 
         valid_dish_ids = []
+        self.dish_modalities = {}  # Track which modalities each dish has
 
         for dish_id in all_dish_ids:
             if dish_id not in self.metadata.index:
                 continue
 
-            is_valid = True
+            # Check which modalities are available for this dish
+            has_side = False
+            has_overhead = False
+            has_depth = False
 
             if self.use_side_frames:
                 side_dir = self.data_root / "imagery" / "side_angles" / dish_id / "frames_sampled5"
-                if not side_dir.is_dir() or not list(side_dir.glob("*.jpeg")):
-                    is_valid = False
+                has_side = side_dir.is_dir() and bool(list(side_dir.glob("*.jpeg")))
 
             if self.use_overhead:
                 overhead_path = self.data_root / "imagery" / "realsense_overhead" / dish_id / "rgb.png"
-                if not overhead_path.is_file() or overhead_path.stat().st_size == 0:
-                    is_valid = False
+                has_overhead = overhead_path.is_file() and overhead_path.stat().st_size > 0
 
             if self.use_depth:
                 depth_path = self.data_root / "imagery" / "realsense_overhead" / dish_id / "depth_raw.png"
-                if not depth_path.is_file() or depth_path.stat().st_size == 0:
+                has_depth = depth_path.is_file() and depth_path.stat().st_size > 0
+
+            if self.allow_missing_modalities:
+                # Accept dish if it has at least one requested modality
+                has_any = (
+                    (self.use_side_frames and has_side) or
+                    (self.use_overhead and has_overhead) or
+                    (self.use_depth and has_depth)
+                )
+                if has_any:
+                    valid_dish_ids.append(dish_id)
+                    self.dish_modalities[dish_id] = {
+                        'side': has_side,
+                        'overhead': has_overhead,
+                        'depth': has_depth
+                    }
+            else:
+                # Require all requested modalities
+                is_valid = True
+                if self.use_side_frames and not has_side:
+                    is_valid = False
+                if self.use_overhead and not has_overhead:
+                    is_valid = False
+                if self.use_depth and not has_depth:
                     is_valid = False
 
-            if is_valid:
-                valid_dish_ids.append(dish_id)
+                if is_valid:
+                    valid_dish_ids.append(dish_id)
+                    self.dish_modalities[dish_id] = {
+                        'side': has_side,
+                        'overhead': has_overhead,
+                        'depth': has_depth
+                    }
 
         self.dish_ids = valid_dish_ids
-        print(f"Loaded {len(self.dish_ids)} dishes from dataset.")
+
+        # Print statistics
+        if self.allow_missing_modalities:
+            side_count = sum(1 for d in self.dish_modalities.values() if d['side'])
+            overhead_count = sum(1 for d in self.dish_modalities.values() if d['overhead'])
+            depth_count = sum(1 for d in self.dish_modalities.values() if d['depth'])
+            print(f"Loaded {len(self.dish_ids)} dishes (side: {side_count}, overhead: {overhead_count}, depth: {depth_count})")
+        else:
+            print(f"Loaded {len(self.dish_ids)} dishes from dataset.")
 
         # Calculate resize dimensions (slightly larger for cropping)
         resize_size = int(image_size * 1.125)  # 12.5% larger for crop
 
-        # Side frames: pad to square first to preserve full 16:9 content
-        # 1920x1080 -> 1920x1920 (black bars top/bottom) -> 224x224
+        # Side frames: Resize + CenterCrop (same as overhead)
+        # Food is centered, and rotating cameras provide redundancy for edge content
         if train:
             self.side_transform = transforms.Compose([
-                PadToSquare(),  # Pad to square, preserving all content
-                transforms.Resize((image_size, image_size)),  # Resize to target
+                transforms.Resize(resize_size),
+                transforms.CenterCrop(image_size),
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                 transforms.ToTensor(),
@@ -135,8 +220,8 @@ class MultiViewDataset(Dataset):
             ])
         else:
             self.side_transform = transforms.Compose([
-                PadToSquare(),  # Pad to square, preserving all content
-                transforms.Resize((image_size, image_size)),  # Resize to target
+                transforms.Resize(resize_size),
+                transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225]),
@@ -187,13 +272,10 @@ class MultiViewDataset(Dataset):
                 indices = [int(i * n / frames_per_camera) for i in range(frames_per_camera)]
                 sampled_per_camera[camera] = [available[i] for i in indices]
 
-        # Interleave cameras: [A0, B0, C0, D0, A1, B1, C1, D1, ...]
+        # Sequential by camera: [A0, A1, B0, B1, C0, C1, D0, D1, ...]
         selected_frames = []
-        max_len = max(len(v) for v in sampled_per_camera.values())
-        for i in range(max_len):
-            for camera in cameras:
-                if i < len(sampled_per_camera.get(camera, [])):
-                    selected_frames.append(sampled_per_camera[camera][i])
+        for camera in cameras:
+            selected_frames.extend(sampled_per_camera.get(camera, []))
 
         return selected_frames[:self.max_side_frames]
 
@@ -205,21 +287,36 @@ class MultiViewDataset(Dataset):
         row = self.metadata.loc[dish_id]
         targets = torch.tensor([row[t] for t in TARGETS], dtype=torch.float32)
 
-        if self.use_overhead:
+        # Check which modalities this dish actually has
+        if self.allow_missing_modalities:
+            modalities = self.dish_modalities.get(dish_id, {})
+            has_side = modalities.get('side', False)
+            has_overhead = modalities.get('overhead', False)
+            has_depth = modalities.get('depth', False)
+        else:
+            # If not allowing missing, assume all requested modalities exist
+            has_side = self.use_side_frames
+            has_overhead = self.use_overhead
+            has_depth = self.use_depth
+
+        # Load overhead RGB if requested and available
+        if self.use_overhead and has_overhead:
             overhead_path = self.data_root / "imagery" / "realsense_overhead" / dish_id / "rgb.png"
             overhead_img = Image.open(overhead_path).convert("RGB")
             overhead_img = self.overhead_transform(overhead_img)
         else:
             overhead_img = None
 
-        if self.use_depth:
+        # Load depth if requested and available
+        if self.use_depth and has_depth:
             depth_path = self.data_root / "imagery" / "realsense_overhead" / dish_id / "depth_raw.png"
             depth_img = Image.open(depth_path).convert("L")
             depth_img = self.depth_transform(depth_img)
         else:
             depth_img = None
 
-        if self.use_side_frames:
+        # Load side frames if requested and available
+        if self.use_side_frames and has_side:
             frame_paths = self._load_side_frames(dish_id)
             side_frames = []
 
