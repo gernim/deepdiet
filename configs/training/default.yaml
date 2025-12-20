@@ -1,0 +1,17 @@
+# Training configuration
+# Override: python src/train_hydra.py training.lr=5e-5
+
+epochs: 20
+batch_size: 4
+lr: 1e-4
+weight_decay: 1e-4
+
+# Learning rate schedule
+lr_decay_epochs: 5
+lr_decay_factor: 0.5
+
+# Gradient clipping
+max_grad_norm: 5.0
+
+# Data loading
+num_workers: 2

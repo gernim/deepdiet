@@ -24,6 +24,15 @@ import math
 import argparse
 import time
 import numpy as np
+import os
+
+# Weights & Biases for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Run 'pip install wandb' for experiment tracking.")
 from src.metrics import (
     compute_per_layer_step_sizes,
     compute_activation_stats,
@@ -83,6 +92,14 @@ def main():
                         help='Side frame aggregation method: lstm, attention, or mean (default: lstm)')
     parser.add_argument('--allow-missing-modalities', action='store_true',
                         help='Allow training with partial modalities (uses learned embeddings for missing inputs)')
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable Weights & Biases logging (default: disabled)')
+    parser.add_argument('--wandb-project', type=str, default='deepdiet',
+                        help='W&B project name (default: deepdiet)')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                        help='W&B run name (default: auto-generated)')
+    parser.add_argument('--wandb-tags', type=str, nargs='*', default=[],
+                        help='W&B tags for this run (e.g., --wandb-tags baseline attention)')
     args = parser.parse_args()
 
     config = create_config(args, REPO)
@@ -93,11 +110,54 @@ def main():
     # Create TensorBoard logger
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     enabled_inputs = config.get_input_channels()
-    run_name = f"{'_'.join(enabled_inputs)}_{timestamp}"
+    run_name = f"{'_'.join(enabled_inputs)}_{args.side_aggregation}_{timestamp}"
     log_dir = REPO / "runs" / run_name
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard logs: {log_dir}")
     print(f"Run: tensorboard --logdir runs/")
+
+    # Initialize Weights & Biases if enabled
+    use_wandb = args.wandb and WANDB_AVAILABLE
+    if args.wandb and not WANDB_AVAILABLE:
+        print("Warning: --wandb flag set but wandb not installed. Skipping W&B logging.")
+
+    if use_wandb:
+        wandb_run_name = args.wandb_run_name or run_name
+        wandb_config = {
+            # Model architecture
+            "side_aggregation": args.side_aggregation,
+            "use_side_frames": args.use_side_frames,
+            "use_overhead": args.use_overhead,
+            "use_depth": args.use_depth,
+            "lstm_hidden": args.lstm_hidden,
+            "max_frames": args.max_frames,
+            "image_size": args.image_size,
+            # Training params
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "freeze_encoders": args.freeze_encoders,
+            "unfreeze_epoch": args.unfreeze_epoch,
+            "encoder_lr_multiplier": args.encoder_lr_multiplier,
+            "allow_missing_modalities": args.allow_missing_modalities,
+            # Environment
+            "device": str(device),
+        }
+
+        # Auto-generate tags based on config
+        auto_tags = list(enabled_inputs) + [args.side_aggregation]
+        if args.freeze_encoders:
+            auto_tags.append("frozen_encoders")
+        all_tags = auto_tags + args.wandb_tags
+
+        wandb.init(
+            project=args.wandb_project,
+            name=wandb_run_name,
+            config=wandb_config,
+            tags=all_tags,
+            sync_tensorboard=True,  # Also sync TensorBoard logs
+        )
+        print(f"W&B run: {wandb.run.url}")
 
     if not enabled_inputs:
         print("ERROR: At least one input type must be enabled!")
@@ -349,6 +409,26 @@ def main():
 
             # Flush TensorBoard writer to disk
             writer.flush()
+
+            # Log to W&B (in addition to TensorBoard sync)
+            if use_wandb:
+                wandb_metrics = {
+                    "epoch": epoch,
+                    "train/loss": train_total_loss,
+                    "val/loss": val_total_loss,
+                    "time/epoch": epoch_time,
+                    "time/data_load": data_load_time,
+                    "time/forward": forward_time,
+                    "time/backward": backward_time,
+                    "best_val_loss": best_val_loss,
+                }
+                for task in TARGETS:
+                    wandb_metrics[f"train/mae_{task}"] = train_losses[task]
+                    wandb_metrics[f"val/mae_{task}"] = val_losses[task]
+                    wandb_metrics[f"train/mae_pct_{task}"] = train_losses[task] / target_means[task] * 100
+                    wandb_metrics[f"val/mae_pct_{task}"] = val_losses[task] / target_means[task] * 100
+                wandb.log(wandb_metrics, step=epoch)
+
             print(f"  [DEBUG] Logged {len(TARGETS)*4 + 6} metrics to TensorBoard for epoch {epoch}")
 
             # Compute additional metrics (do this every few epochs to minimize overhead)
@@ -465,11 +545,21 @@ def main():
             print(f"Best model saved at: {REPO / 'indexes' / model_name}")
         print("=" * 70)
         writer.close()
+        if use_wandb:
+            wandb.finish(exit_code=1)
         return
 
     print("=" * 70)
     print(f"Training complete! Best validation MAE: {best_val_loss:.3f}")
     writer.close()
+
+    # Finish W&B run and log final summary
+    if use_wandb:
+        wandb.summary["best_val_loss"] = best_val_loss
+        wandb.summary["final_train_loss"] = train_total_loss
+        for task in TARGETS:
+            wandb.summary[f"best_val_mae_{task}"] = val_losses[task]
+        wandb.finish()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+# Model configuration
+# Override: python src/train_hydra.py model=attention
+
+# Modalities to use
+use_side_frames: true
+use_overhead: true
+use_depth: true
+allow_missing_modalities: false
+
+# Side frame aggregation: lstm, attention, or mean
+side_aggregation: lstm
+
+# LSTM-specific (ignored if using attention/mean)
+lstm_hidden: 640
+
+# Encoder settings
+freeze_encoders: false
+unfreeze_epoch: 10
+encoder_lr_multiplier: 0.1
+
+# Processing
+chunk_size: 4  # Frames processed at once (lower = less memory)

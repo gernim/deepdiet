@@ -1,0 +1,16 @@
+# DeepDiet Training Configuration
+# Use Hydra to manage experiments: python src/train_hydra.py
+# Override from command line: python src/train_hydra.py model.side_aggregation=attention training.lr=5e-5
+
+defaults:
+  - _self_
+  - model: default
+  - training: default
+  - data: default
+  - logging: default
+
+# Experiment metadata
+experiment:
+  name: null  # Auto-generated if null
+  tags: []
+  notes: ""

@@ -1,0 +1,255 @@
+Experiment 1
+Multi-Modal CNN–LSTM
+
+Training val and loss:
+overhead_depth_20251130_230108
+
+
+Objective: Establish a baseline model using a two-stream fusion architecture that processes overhead RGB and depth as separate modalities, rather than concatenating depth as a 4th channel
+
+Results: A summary of baseline performance compared to the Nutrition5k reference models is provided in Appendix 5. Our fusion model performs competitively on calories and substantially improves over the “Depth as 4th Channel” approach on mass prediction. Macronutrient estimates lag behind the Nutrition5k portion-independent models, consistent with the increased difficulty of joint end-to-end optimization.
+
+Interpretation: The two-stream fusion architecture achieved competitive results on calorie pre-
+diction (49.9 vs. 47.6 MAE) and substantially outperformed the “Depth as 4th Channel” approach on mass prediction (33.0 vs. 40.7 MAE), approaching the more complex “Volume Scalar” pipeline (29.4 MAE). This suggests that treating RGB and depth as separate modalities with dedicated en-coders allows the network to learn portion-relevant features more effectively than naive channel concatenation. The fusion layer can capture complementary geometric and appearance cues, similar 6 to how the Volume Scalar method benefits from explicit geometric reasoning about depth. However, macronutrient predictions (fat, carbs, protein) lag behind the paper’s results by approximately 2×. In the Nutrition5k paper, the strongest macronutrient models were portion-independent density predictors trained separately and multiplied by predicted mass. Our end-to-end approach must jointly learn portion estimation and density prediction, making optimization more difficult.
+
+Experiment 2
+First run
+overhead_depth_side_20251201_091912
+
+Overhead_depth_side_20251130_132911
+
+  Training Curve Analysis
+
+  Side + Overhead + Depth (100 epochs)
+
+  | Epoch | Train Loss | Val Loss | Gap               |
+  |-------|------------|----------|-------------------|
+  | 1     | 256        | 203      | -53 (val better!) |
+  | 5     | 140        | 238      | +98               |
+  | 10    | 104        | 223      | +119              |
+  | 25    | 82         | 203      | +121              |
+  | 50    | 80         | 199      | +119              |
+  | 100   | 80         | 165      | +85               |
+
+  Overhead + Depth Only (100 epochs)
+
+  | Epoch | Train Loss | Val Loss | Gap               |
+  |-------|------------|----------|-------------------|
+  | 1     | 265        | 174      | -91 (val better!) |
+  | 5     | 144        | 136      | -8                |
+  | 10    | 106        | 117      | +11               |
+  | 25    | 87         | 109      | +22               |
+  | 50    | 80         | 104      | +24               |
+  | 100   | 82         | 106      | +24               |
+
+  ---
+  Key Observations
+
+  1. Massive overfitting with side frames: The val loss never improves after epoch 1 for the side model - it starts at 203 and stays around 170-240 for 100 epochs. Meanwhile train loss drops from 256 → 80.
+  2. Overhead-only generalizes well: Val loss steadily decreases from 174 → 106, tracking train loss reasonably.
+  3. Strange epoch 1 behavior: Both models have validation loss better than train loss at epoch 1. This is unusual but can happen with dropout/augmentation being on during training but off during validation.
+  4. Side model plateaus quickly: Train loss for side model hits ~80 by epoch 25 and stays flat. The model has effectively memorized the training set but learned nothing generalizable.
+
+  ---
+  Diagnosis: The Side Frame Branch is Learning Noise
+
+  The side frames are providing the model a "shortcut" to memorize training dishes rather than learning generalizable visual features about food. This could be because:
+
+  1. Too much capacity: 8 frames × EfficientNet + LSTM = lots of parameters to memorize with
+  2. Frame-specific memorization: The model might be recognizing specific frames/angles rather than food content
+  3. Inconsistent frame quality: If side frames vary significantly between dishes, they add noise
+
+  ---
+  Questions to narrow down the fix:
+
+  1. Have you tried side-frames ONLY (no overhead/depth)? This would tell us if side frames are inherently problematic or if it's the combination.
+  2. What happens if you freeze the side encoder? Keep EfficientNet weights frozen and only train the LSTM + fusion layers.
+  3. What if you use fewer frames? Try --max-frames 1 or --max-frames 4 to reduce capacity.
+
+Experiment 3
+Proper side sampling
+overhead_depth_side_20251201_004538
+
+
+6. Side Frame Sampling Strategy
+
+  Initial Implementation
+
+  - Original approach: Alphabetically sorted, take first N frames
+  - Problem: Frame names like camera_A_frame_001.jpeg sort by camera first, resulting in all frames from camera A, then B, etc.
+  - Result: Only seeing 1-2 camera angles instead of 360° coverage
+
+  Camera Diversity Fix (First Iteration)
+
+  - Solution: Round-robin interleaving across 4 cameras
+  - Result: Ensures all 4 camera angles represented
+  - Example (max_frames=8): A1, B1, C1, D1, A2, B2, C2, D2
+
+  Temporal Diversity Fix (Second Iteration)
+
+  - Problem: Round-robin still takes consecutive frames from each camera (frames 1, 2, 3...)
+  - Issue: Camera is rotating, so consecutive frames are similar
+  - Final Solution: Uniform sampling within each camera's timeline
+  frames_per_camera = max_side_frames // num_cameras  # e.g., 8 // 4 = 2
+  indices = [int(i * num_available / frames_per_camera) for i in range(frames_per_camera)]
+  - Result: Both camera diversity AND temporal diversity
+    - 4 cameras: 90° viewing angle differences
+    - Evenly spaced frames: Maximum temporal coverage per camera
+    - Example: If 7 frames per camera, takes frames at indices [0, 3] → early + late frames
+
+
+
+Validation Loss Comparison (First 10 Epochs)
+
+  | Epoch | Old Side Sampling | New Side Sampling | Improvement |
+  |-------|-------------------|-------------------|-------------|
+  | 1     | 203               | 192               | -5%         |
+  | 2     | 206               | 182               | -12%        |
+  | 3     | 237               | 191               | -19%        |
+  | 4     | 221               | 223               | +1%         |
+  | 5     | 238               | 160               | -33%        |
+  | 6     | 207               | 161               | -22%
+  | 7     | 202               | 143               | -29%        |
+  | 8     | 189               | 142               | -25%
+  | 9     | 174               | 137               | -21%        |
+  | 10    | 223               | 135               | -39%        |
+
+  Key Observations
+
+  1. Much better trajectory: Val loss is actually decreasing consistently now (192 → 135) instead of bouncing around (203 → 223)
+  2. Less variance: The old sampling had wild swings (174 → 223 between epochs 9-10). New sampling is smoother.
+  3. Already competitive: At epoch 10, new side sampling (135) is approaching the overhead-only model's epoch 10 performance (117).
+  4. No severe overfitting yet: The old model had val loss increasing after epoch 1. This one is trending down.
+
+  ---
+  Next Steps
+
+  Let this run continue for another 15-25 epochs to see:
+  1. Does val loss continue to decrease or plateau?
+  2. Does it eventually beat the overhead-only baseline (~105-109)?
+  3. Does overfitting eventually kick in?
+
+
+
+Hmm, the improvement has stalled. Let me analyze:
+
+  Analysis
+
+  | Metric                 | Value                        |
+  |------------------------|------------------------------|
+  | Best val loss          | 134.5 (epoch 17)             |
+  | Current val loss       | 142.3 (epoch 28)             |
+  | Trend after epoch 10   | Plateaued with high variance |
+  | Overhead-only baseline | ~105-109                     |
+
+  The Problem
+
+  The model hit a floor around 134-137 and is now oscillating (134 → 184 → 136 → 169 → 140...). This suggests:
+
+  1. Still overfitting - the high variance indicates the model isn't learning stable generalizable features
+  2. Better than before - old sampling never got below 165, so the frame diversity helped
+  3. But not enough - still ~25-30% worse than overhead-only
+
+  Recommendations
+
+  Now is a good time to try the encoder freezing approach. The side frames are providing some signal, but the encoder is likely still memorizing training-specific patterns.
+
+  Try this run:
+
+  PYTHONPATH=. python src/train.py \
+      --use-side-frames \
+      --use-overhead \
+      --use-depth \
+      --epochs 50 \
+      --batch-size 8 \
+      --lr 1e-4 \
+      --max-frames 8 \
+      --freeze-encoders \
+      --unfreeze-epoch 20 \
+      --encoder-lr-multiplier 0.1
+
+  Rationale:
+  - Freeze encoders for first 20 epochs → forces LSTM + fusion layers to learn good aggregation
+  - Unfreeze with 10× lower encoder LR → gentle fine-tuning without destroying pretrained features
+  - If val loss is still improving at epoch 20, the unfreezing might push it past the 105 barrier
+
+  Alternatively, you could also try side-frames only (no overhead/depth) to see if the side frames alone can match overhead performance - that would tell us if the fusion is the problem vs. the side features themselves.
+
+
+
+
+Experiment 4
+Architecture improvements. freeze feature layers in early epochs, discriminative learning rates
+
+overhead_depth_side_20251201_220514
+
+ Encoder freezing | Overfitting, unstable training
+More stable convergence, better generalization
+7. Optimization
+Gradient Clipping
+Value: Max norm of 1.0
+Rationale: Prevent exploding gradients, especially important with LSTM
+Code location: src/train.py:720, 733
+Optimizer & Learning Rate
+Optimizer: Adam with weight_decay=1e-4
+Initial LR: 1e-4 (configurable via --lr)
+Schedule: Decay by 0.5 every 5 epochs
+Rationale: Standard choices for vision models, aggressive decay for fine-tuning
+Code location: src/train.py:641, 856-858
+
+Experiment 5
+overhead_depth_side_20251203_131326
+ Problem: The dataset has uneven modality coverage:
+  - 3,930 dishes have side frames
+  - 2,755 dishes have overhead RGB
+  - ~2,758 dishes have depth
+  - Only 2,638 dishes have all three modalities
+
+  Previously, training required all requested modalities to be present, discarding ~1,300 dishes with partial data.
+
+2. Why We Did It
+
+  | Motivation                   | Explanation                                                                                            |
+  |------------------------------|--------------------------------------------------------------------------------------------------------|
+  | More training data           | 4,047 dishes instead of 2,638 (+53% more data)                                                         |
+  | Side encoder was overfitting | Previous runs showed training loss decreasing but validation loss plateauing; more data should help    |
+  | Utilize full dataset         | The Nutrition5k dataset has dishes with varying sensor availability; we were throwing away useful data |
+  | Implicit regularization      | Randomly encountering missing modalities during training acts like dropout at the modality level       |
+
+  ---
+  3. How It Works
+
+  When a modality is missing for a dish:
+
+  Forward pass with all modalities:
+    side_frames → side_encoder → [1280-dim] ─┐
+    overhead_rgb → overhead_encoder → [1280-dim] ─┼─→ concat → fusion → predictions
+    overhead_depth → depth_encoder → [1280-dim] ─┘
+
+  Forward pass with missing overhead:
+    side_frames → side_encoder → [1280-dim] ─┐
+    missing_overhead_embed (learned) → [1280-dim] ─┼─→ concat → fusion → predictions
+    missing_depth_embed (learned) → [1280-dim] ─┘
+
+  The learned embeddings are initialized as small random vectors (torch.randn(...) * 0.02) and trained alongside the model. They learn to represent "no data available for this modality."
+
+  ---
+  4. Expected Results
+
+  | Aspect                  | Expected Impact                                                                                      |
+  |-------------------------|------------------------------------------------------------------------------------------------------|
+  | Reduced overfitting     | +53% more training data should help the model generalize better                                      |
+  | Better side encoder     | Gets 3,930 training examples instead of 2,638                                                        |
+  | Comparable test results | Test set is identical (same 709 dishes), so results are directly comparable to previous runs         |
+  | Learned embeddings      | Model learns what "missing" means; may learn to rely more on available modalities when one is absent |
+  | Training dynamics       | Batches will have mixed modality availability, forcing the model to be robust                        |
+
+ 6. Data Breakdown
+
+  | Subset               | Train | Test |
+  |----------------------|-------|------|
+  | All three modalities | 2,638 | 474  |
+  | Side frames only     | 1,292 | 202  |
+  | Overhead only        | 117   | 33   |
+  | Total                | 4,047 | 709  |
+

@@ -1,0 +1,13 @@
+# Fast training configuration for debugging/testing
+# Use: python src/train_hydra.py training=fast
+
+epochs: 3
+batch_size: 2
+lr: 1e-4
+weight_decay: 1e-4
+
+lr_decay_epochs: 5
+lr_decay_factor: 0.5
+max_grad_norm: 5.0
+
+num_workers: 0  # Easier debugging
