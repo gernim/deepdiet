@@ -1,0 +1,16 @@
+# Side frames only configuration (ablation study)
+# Use: python src/train_hydra.py model=side_only
+
+use_side_frames: true
+use_overhead: false
+use_depth: false
+allow_missing_modalities: false
+
+side_aggregation: attention
+lstm_hidden: 640
+
+freeze_encoders: false
+unfreeze_epoch: 10
+encoder_lr_multiplier: 0.1
+
+chunk_size: 4

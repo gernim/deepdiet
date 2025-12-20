@@ -1,0 +1,9 @@
+# Local-only logging (no W&B)
+# Use: python src/train_hydra.py logging=local
+
+wandb: false
+wandb_project: deepdiet
+wandb_entity: null
+
+tensorboard: true
+advanced_metrics_freq: 2

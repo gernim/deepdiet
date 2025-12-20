@@ -1,0 +1,50 @@
+
+Experiment 1:
+overhead_depth_20251130_230108
+python ../scripts/plot_training_runs.py --labels "Baseline (overhead+depth)" "Multi-modal (side view+overhead+depth)" --runs overhead_depth_20251130_230108_loss_val.csv overhead_depth_side_20251201_004538_loss_val.csv --ylabel "Valuation Loss" --max-steps 30 --output valuation_loss_exp1.png
+python ../scripts/plot_training_runs.py --labels "Baseline (overhead+depth)" "Multi-modal (side view+overhead+depth)" --runs overhead_depth_20251130_230108_loss_train.csv overhead_depth_side_20251201_004538_loss_train.csv --ylabel "Training Loss" --max-steps 30 --output training_loss_exp1.png
+
+Experiment 2:
+first attempt at all modalities
+overhead_depth_side_20251201_091912
+overhead_depth_side_20251201_091912_loss_train.csv
+overhead_depth_side_20251201_091912_loss_val.csv
+
+Experiment 3: Data improvements (sampling)
+overhead_depth_side_20251201_004538
+overhead_depth_side_20251201_004538_loss_train.csv
+overhead_depth_side_20251201_004538_loss_val.csv
+
+
+Experiment 4: Architecture changes (layer freezing, variable lr)
+overhead_depth_side_20251201_220514
+overhead_depth_side_20251201_220514_loss_train.csv
+overhead_depth_side_20251201_220514_loss_val.csv
+
+
+Experiment 5: Missing modalities
+overhead_depth_side_20251203_131326
+overhead_depth_side_20251203_131326_loss_train.csv
+overhead_depth_side_20251203_131326_loss_val.csv
+
+
+python ../scripts/plot_training_runs.py \
+--labels "Experiment 1" "Experiment 2" "Experiment 3" "Experiment 4" "Experiment 5" \
+--runs overhead_depth_20251130_230108_loss_train.csv overhead_depth_side_20251201_091912_loss_train.csv overhead_depth_side_20251201_004538_loss_train.csv overhead_depth_side_20251201_220514_loss_train.csv overhead_depth_side_20251203_131326_loss_train.csv \
+--smoothing 0.6 --ylabel "MAE" --max-steps 30 --output training_loss_exp5.png
+
+python ../scripts/plot_training_runs.py \
+--labels "Experiment 1" "Experiment 2" "Experiment 3" "Experiment 4" "Experiment 5" \
+--runs overhead_depth_20251130_230108_loss_val.csv overhead_depth_side_20251201_091912_loss_val.csv overhead_depth_side_20251201_004538_loss_val.csv overhead_depth_side_20251201_220514_loss_val.csv overhead_depth_side_20251203_131326_loss_val.csv \
+--smoothing 0.6 --ylabel "MAE" --max-steps 30 --output valuation_loss_exp5.png
+
+
+python ../scripts/plot_training_runs.py \
+--labels "Experiment 1" "Experiment 2" "Experiment 3" "Experiment 4" \
+--runs overhead_depth_20251130_230108_loss_train.csv overhead_depth_side_20251201_004538_loss_train.csv overhead_depth_side_20251201_220514_loss_train.csv overhead_depth_side_20251203_131326_loss_train.csv \
+--smoothing 0.6 --ylabel "MAE" --max-steps 30 --output training_loss_exp5.png
+
+python ../scripts/plot_training_runs.py \
+--labels "Experiment 1" "Experiment 2" "Experiment 3" "Experiment 4" \
+--runs overhead_depth_20251130_230108_loss_val.csv overhead_depth_side_20251201_004538_loss_val.csv overhead_depth_side_20251201_220514_loss_val.csv overhead_depth_side_20251203_131326_loss_val.csv \
+--smoothing 0.6 --ylabel "MAE" --max-steps 30 --output valuation_loss_exp5.png

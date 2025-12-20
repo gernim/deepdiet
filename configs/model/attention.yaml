@@ -1,0 +1,21 @@
+# Attention-based model configuration
+# Use: python src/train_hydra.py model=attention
+
+# Modalities
+use_side_frames: true
+use_overhead: true
+use_depth: true
+allow_missing_modalities: false
+
+# Use temporal attention for side frames
+side_aggregation: attention
+
+# LSTM hidden (not used with attention, but kept for compatibility)
+lstm_hidden: 640
+
+# Encoder settings
+freeze_encoders: false
+unfreeze_epoch: 10
+encoder_lr_multiplier: 0.1
+
+chunk_size: 4

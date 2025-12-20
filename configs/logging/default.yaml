@@ -1,0 +1,13 @@
+# Logging configuration
+# Override: python src/train_hydra.py logging.wandb=true
+
+# Weights & Biases
+wandb: true
+wandb_project: deepdiet
+wandb_entity: null  # Your W&B username/team (null = default)
+
+# TensorBoard (always enabled)
+tensorboard: true
+
+# Advanced metrics frequency
+advanced_metrics_freq: 2
