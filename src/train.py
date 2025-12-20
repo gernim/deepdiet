@@ -79,8 +79,8 @@ def main():
                         help='Epoch to unfreeze encoders (default: 10)')
     parser.add_argument('--encoder-lr-multiplier', type=float, default=0.1,
                         help='LR multiplier for encoders when unfrozen (default: 0.1)')
-    parser.add_argument('--side-aggregation', type=str, default='lstm', choices=['lstm', 'mean'],
-                        help='Side frame aggregation method: lstm or mean (default: lstm)')
+    parser.add_argument('--side-aggregation', type=str, default='lstm', choices=['lstm', 'attention', 'mean'],
+                        help='Side frame aggregation method: lstm, attention, or mean (default: lstm)')
     parser.add_argument('--allow-missing-modalities', action='store_true',
                         help='Allow training with partial modalities (uses learned embeddings for missing inputs)')
     args = parser.parse_args()

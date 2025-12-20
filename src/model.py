@@ -30,7 +30,7 @@ class DeepDietModel(nn.Module):
         self.use_depth = use_depth and use_overhead
         self.chunk_size = chunk_size
         self.lstm_hidden = lstm_hidden
-        self.side_aggregation = side_aggregation  # 'lstm' or 'mean'
+        self.side_aggregation = side_aggregation  # 'lstm', 'attention', or 'mean'
         self.allow_missing_modalities = allow_missing_modalities
 
         total_features = 0
@@ -43,6 +43,22 @@ class DeepDietModel(nn.Module):
             if self.side_aggregation == 'lstm':
                 self.side_aggregator = nn.LSTM(1280, self.lstm_hidden, batch_first=True, bidirectional=True)
                 side_feat_dim = self.lstm_hidden * 2
+            elif self.side_aggregation == 'attention':
+                # Temporal self-attention over frames
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=1280,
+                    nhead=8,
+                    dim_feedforward=2048,
+                    dropout=0.1,
+                    activation='gelu',
+                    batch_first=True
+                )
+                self.side_aggregator = nn.TransformerEncoder(encoder_layer, num_layers=2)
+                # Learnable [CLS] token for aggregation
+                self.side_cls_token = nn.Parameter(torch.randn(1, 1, 1280) * 0.02)
+                # Learnable positional embeddings (max 17 positions: 1 CLS + 16 frames)
+                self.side_pos_embed = nn.Parameter(torch.randn(1, 17, 1280) * 0.02)
+                side_feat_dim = 1280
             else:
                 # Mean pooling: output is raw EfficientNet features (1280)
                 side_feat_dim = 1280
@@ -204,6 +220,17 @@ class DeepDietModel(nn.Module):
                 if self.side_aggregation == 'lstm':
                     side_feat, _ = self.side_aggregator(side_features)
                     side_feat = side_feat.mean(dim=1)
+                elif self.side_aggregation == 'attention':
+                    # Prepend [CLS] token to frame features
+                    cls_tokens = self.side_cls_token.expand(batch_size, -1, -1)
+                    side_features_with_cls = torch.cat([cls_tokens, side_features], dim=1)
+                    # Add positional embeddings (slice to match sequence length: 1 CLS + num_frames)
+                    seq_len = side_features_with_cls.size(1)
+                    side_features_with_cls = side_features_with_cls + self.side_pos_embed[:, :seq_len, :]
+                    # Apply transformer encoder
+                    attended = self.side_aggregator(side_features_with_cls)
+                    # Extract [CLS] token as aggregated representation
+                    side_feat = attended[:, 0, :]
                 else:
                     # Simple mean pooling over frames
                     side_feat = side_features.mean(dim=1)
