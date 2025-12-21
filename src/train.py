@@ -90,6 +90,8 @@ def main():
                         help='LR multiplier for encoders when unfrozen (default: 0.1)')
     parser.add_argument('--side-aggregation', type=str, default='lstm', choices=['lstm', 'attention', 'mean'],
                         help='Side frame aggregation method: lstm, attention, or mean (default: lstm)')
+    parser.add_argument('--grad-clip', type=float, default=1.0,
+                        help='Gradient clipping max norm (default: 1.0, use lower for attention)')
     parser.add_argument('--allow-missing-modalities', action='store_true',
                         help='Allow training with partial modalities (uses learned embeddings for missing inputs)')
     parser.add_argument('--wandb', action='store_true',

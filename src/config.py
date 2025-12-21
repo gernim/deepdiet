@@ -10,7 +10,7 @@ class TrainingConfig:
     batch_size: int = 16
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-    grad_clip_norm: Optional[float] = 5.0
+    grad_clip_norm: float = 1.0  # More aggressive clipping for attention
     lr_decay_epochs: Optional[int] = 5
     lr_decay_factor: Optional[float] = 0.5
 
@@ -77,6 +77,7 @@ def create_config(args, repo_root: Path) -> TrainingConfig:
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        grad_clip_norm=getattr(args, 'grad_clip', 1.0),
 
         # Model
         max_frames=args.max_frames,
