@@ -32,7 +32,7 @@ The primary Multi-modal CNN-LSTM model uses a three-branch encoder-fusion archit
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │   Side Frames   │     │  Overhead RGB   │     │  Overhead Depth │
-│  [B, 16, 3, H, W]│     │   [B, 3, H, W]  │     │   [B, 1, H, W]  │
+│ [B, 16, 3, H, W]│     │   [B, 3, H, W]  │     │   [B, 1, H, W]  │
 └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
          │                       │                       │
          ▼                       ▼                       ▼
