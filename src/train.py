@@ -138,6 +138,7 @@ def main():
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "learning_rate": args.lr,
+            "grad_clip": args.grad_clip,
             "freeze_encoders": args.freeze_encoders,
             "unfreeze_epoch": args.unfreeze_epoch,
             "encoder_lr_multiplier": args.encoder_lr_multiplier,
